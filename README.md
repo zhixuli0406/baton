@@ -40,7 +40,7 @@ baton install --apply    # 寫入設定並註冊 MCP server
 
 分工是這樣：Claude 負責跟你溝通、規劃和派工，Codex 是主要的實作者，Grok 是備援，兩家都沒額度時才由 Claude 自己寫。Claude 呼叫 `delegate` 時，baton 照這個順序走：
 
-1. 先查 Codex 額度。baton 啟動 `codex app-server` 呼叫 `account/rateLimits/read`，這個查詢不耗額度，約 1.6 秒。結果快取 5 分鐘（`probe_ttl_secs`）。
+1. 先查 Codex 額度。baton 啟動 `codex app-server` 呼叫 `account/rateLimits/read`，這個查詢不耗額度，約 1.6 秒。結果快取 5 分鐘（`probe_ttl_secs`）；同一個 Claude Code session 裡同時有好幾個派工時，只有第一個會去探測，其餘直接用它的結果。
 2. Codex 額度用完就跳過，改叫 Grok。Grok CLI 沒有額度查詢 API，所以 baton 只能在 Grok 呼叫失敗、錯誤訊息看起來是額度問題時（例如 `402 Payment Required: Grok Build usage balance exhausted`），把它標為用完，封鎖 1 小時（`cooldown_secs`）。
 3. 探針說還有額度，但實際呼叫時撞到額度上限（ChatGPT 端的額度狀態偶爾會跟實際不一致），baton 會記錄下來，換下一家重跑同一個任務。這種情況只封鎖到下一次該探測的時候（`probe_ttl_secs`），之後再以探針為準。探針本身失敗時，尚未到期的封鎖會保留。
 4. 兩家都不能用時，回覆以 `DELEGATES_EXHAUSTED` 開頭，列出各家狀態與重置時間，Claude 收到後自己做。

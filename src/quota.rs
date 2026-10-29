@@ -460,22 +460,44 @@ async fn refresh_codex(cfg: &RotationConfig) -> Status {
 }
 
 pub async fn check(agent: Agent, cfg: &RotationConfig) -> Status {
-    let now = unix_now();
-    let known = cached(agent);
-    if let Some(st) = &known {
-        if now.saturating_sub(st.checked_at) < i64::try_from(cfg.probe_ttl_secs).unwrap_or(i64::MAX) {
-            return st.clone();
-        }
+    if let Some(st) = fresh(cached(agent), cfg, unix_now()) {
+        return st;
     }
     if agent == Agent::Grok {
-        return known.unwrap_or_else(grok_unknown);
+        return cached(Agent::Grok).unwrap_or_else(grok_unknown);
     }
-    let probed = refresh_codex(cfg).await;
+    // Parallel delegate calls queue here so only the first one probes; the
+    // rest find its answer (or its failure) when their turn comes.
+    let mut last_failure = probe_turn().lock().await;
+    let now = unix_now();
+    let known = cached(agent);
+    if let Some(st) = fresh(known.clone(), cfg, now) {
+        return st;
+    }
+    let program = Agent::Codex.program();
+    let remembered = last_failure.clone().filter(|(p, _)| *p == program).map(|(_, st)| st);
+    let probed = match fresh(remembered, cfg, now) {
+        Some(st) => st,
+        None => refresh_codex(cfg).await,
+    };
+    *last_failure = (probed.state == State::Unknown).then(|| (program, probed.clone()));
     // A broken probe must not erase a block that has not run out yet.
     match known {
         Some(st) if probed.state == State::Unknown && is_blocked(&st, now) => st,
         _ => probed,
     }
+}
+
+fn fresh(st: Option<Status>, cfg: &RotationConfig, now: i64) -> Option<Status> {
+    let ttl = i64::try_from(cfg.probe_ttl_secs).unwrap_or(i64::MAX);
+    st.filter(|st| now.saturating_sub(st.checked_at) < ttl)
+}
+
+/// One Codex probe at a time per process; holds the last failed probe
+/// (never written to disk), keyed by the codex binary it ran.
+fn probe_turn() -> &'static tokio::sync::Mutex<Option<(String, Status)>> {
+    static TURN: std::sync::OnceLock<tokio::sync::Mutex<Option<(String, Status)>>> = std::sync::OnceLock::new();
+    TURN.get_or_init(|| tokio::sync::Mutex::new(None))
 }
 
 pub async fn record_quota_error(agent: Agent, error_text: &str, cfg: &RotationConfig) -> Status {
@@ -532,6 +554,37 @@ fn rotation_line(cfg: &RotationConfig) -> String {
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::path::{Path, PathBuf};
+
+    use serde_json::{json, Value};
+
+    pub const CODEX_LIMIT: &str = "ERROR: You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at Nov 4th, 2026 2:38 PM.";
+    pub const GROK_LIMIT: &str = r#"Error: Internal error: { "message": "API error (status 402 Payment Required): Grok Build usage balance exhausted", "http_status": 402 }"#;
+
+    /// An executable `/bin/sh` script at `dir/name`.
+    #[cfg(unix)]
+    pub fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    /// A `account/rateLimits/read` result with one weekly window resetting in a day.
+    pub fn probe_result(used: u32, reached: bool) -> Value {
+        let resets = chrono::Utc::now().timestamp() + 86_400;
+        json!({
+            "ordinaryUsageAllowed": !reached,
+            "rateLimits": {
+                "primary": {"usedPercent": used, "windowDurationMins": 10080, "resetsAt": resets},
+                "credits": {"hasCredits": false, "unlimited": false},
+                "planType": "promax",
+                "rateLimitReachedType": if reached { json!("rate_limit_reached") } else { Value::Null }
+            }
+        })
+    }
+
     /// A `/bin/sh` stand-in for the codex CLI. `app-server` answers
     /// `account/rateLimits/read` with `result_json` asynchronously and, like
     /// the real one, drops the answer when stdin closes first. Any other
@@ -567,7 +620,7 @@ exit 0
 mod tests {
     use super::*;
 
-    const CODEX_LIMIT: &str = "ERROR: You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at Nov 4th, 2026 2:38 PM.";
+    use super::test_support::CODEX_LIMIT;
 
     fn exhausted_fixture() -> Value {
         json!({
@@ -839,6 +892,35 @@ mod tests {
         let cleared = refresh(Agent::Grok, &cfg).await;
         assert_eq!((cleared.state, cleared.source), (State::Unknown, Source::None));
         assert!(cached(Agent::Grok).is_none());
+    }
+
+    /// Five parallel checks, one app-server start: for a good probe and for a dead one.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn parallel_checks_share_one_probe() {
+        let _lock = crate::paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = RotationConfig::default();
+        for (name, answers) in [("good", true), ("dead", false)] {
+            let (_home, dir) = home_lock();
+            let count = dir.path().join("starts");
+            let inner = test_support::script(dir.path(), "inner", &test_support::fake_codex(&test_support::probe_result(100, true).to_string(), ""));
+            let body = if answers {
+                format!("#!/bin/sh\necho x >> {}\nexec {} \"$@\"\n", count.display(), inner.display())
+            } else {
+                format!("#!/bin/sh\necho x >> {}\nexit 1\n", count.display())
+            };
+            let bin = test_support::script(dir.path(), name, &body);
+            let _bin = crate::paths::EnvVar::set("BATON_CODEX_BIN", &bin);
+            let c = || check(Agent::Codex, &cfg);
+            let all = tokio::join!(c(), c(), c(), c(), c());
+            let starts = std::fs::read_to_string(&count).unwrap().lines().count();
+            assert_eq!(starts, 1, "{name}: {starts} probes");
+            let want = if answers { State::Exhausted } else { State::Unknown };
+            for st in [all.0, all.1, all.2, all.3, all.4] {
+                assert_eq!(st.state, want, "{name}");
+            }
+        }
     }
 
     #[test]

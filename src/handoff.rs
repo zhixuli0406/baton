@@ -434,11 +434,13 @@ async fn run_rotation(meta: &mut Meta, config: &Config, brief: &str, stop: &mut 
             Some(Ok(o)) => return Ok((RotationEnd::Done(o.text), skips)),
             Some(Err(e)) if e.1 == agents::ErrorKind::Quota => {
                 let st = quota::record_quota_error(agent, &e.0, &config.rotation).await;
-                skips.push(quota::describe(&st, chrono::Utc::now().timestamp()));
+                let state = quota::describe(&st, chrono::Utc::now().timestamp());
                 if touched() {
-                    let why = format!("{e}\n\n{} hit its quota after changing files, so the handoff was not rotated to another agent. Review the working tree before continuing.", agent.name());
+                    // Not a skip: this agent did run, so the report must not claim a rotation past it.
+                    let why = format!("{e}\n\n{state}\n{} hit its quota after changing files, so the handoff was not rotated to another agent. Review the working tree before continuing.", agent.name());
                     return Ok((RotationEnd::Failed(why), skips));
                 }
+                skips.push(state);
             }
             Some(Err(e)) if e.1 == agents::ErrorKind::Unavailable && !touched() => {
                 let line = e.0.lines().next().unwrap_or(e.0.as_str());
@@ -562,6 +564,9 @@ pub fn result_text(id: &str) -> String {
 
 /// Best-effort desktop notification.
 pub fn notify(message: &str) {
+    if cfg!(test) {
+        return;
+    }
     #[cfg(target_os = "macos")]
     {
         let esc = message.replace('\\', "\\\\").replace('"', "\\\"");
@@ -657,5 +662,106 @@ mod tests {
         config.rotation.enabled = true;
         config.rotation.order = vec![Agent::Grok];
         assert_eq!(rotation_order(Agent::Codex, &config), vec![Agent::Codex, Agent::Grok]);
+    }
+
+    /// A pending handoff in a fresh git repo, with fake codex and grok CLIs
+    /// and a private BATON_HOME. `codex_exec` / `grok` are shell bodies.
+    #[cfg(unix)]
+    struct Worker {
+        repo: PathBuf,
+        _vars: Vec<paths::EnvVar>,
+        _dir: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    fn worker(mode: Mode, codex_exec: &str, grok: &str) -> Worker {
+        use quota::test_support::{fake_codex, probe_result, script};
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let probe = script(&root, "codex-probe", &fake_codex(&probe_result(13, false).to_string(), ""));
+        let codex = script(&root, "codex", &format!("#!/bin/sh\nif [ \"$1\" = app-server ]; then exec {} app-server; fi\ncat >/dev/null\n{codex_exec}\n", probe.display()));
+        let grok = script(&root, "grok", &format!("#!/bin/sh\n{grok}\n"));
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(&repo).status().unwrap().success());
+        let vars = vec![
+            paths::EnvVar::set("BATON_HOME", root.join("home")),
+            paths::EnvVar::set("BATON_CODEX_BIN", &codex),
+            paths::EnvVar::set("BATON_GROK_BIN", &grok),
+        ];
+        let meta = Meta {
+            id: "20261030-rotation".into(),
+            session_id: "s".into(),
+            cwd: repo.clone(),
+            transcript_path: None,
+            agent: Agent::Codex,
+            mode,
+            model: None,
+            timeout_secs: 30,
+            status: Status::Pending,
+            trigger: "manual".into(),
+            pid: None,
+            created_at: paths::now_rfc3339(),
+            started_at: None,
+            finished_at: None,
+            note: None,
+            sensitive_changes: vec![],
+        };
+        save(&meta).unwrap();
+        paths::write_private(&dir_of(&meta.id).join("brief.md"), "brief").unwrap();
+        Worker { repo, _vars: vars, _dir: dir }
+    }
+
+    #[cfg(unix)]
+    async fn finish() -> (Meta, String) {
+        run("20261030-rotation").await.unwrap();
+        (load("20261030-rotation").unwrap(), result_text("20261030-rotation"))
+    }
+
+    const GROK_OK: &str = "touch grok-ran\necho '{\"text\":\"GROK DONE\"}'";
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn worker_rotates_to_grok_when_codex_is_out() {
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let limit = quota::test_support::CODEX_LIMIT;
+        let w = worker(Mode::ReadOnly, &format!("printf '%s\\n' '{limit}' >&2; exit 1"), GROK_OK);
+        let (meta, report) = finish().await;
+        assert_eq!(meta.status, Status::Done, "{report}");
+        assert_eq!(meta.agent, Agent::Grok);
+        assert!(meta.note.as_deref().unwrap_or("").starts_with("rotated: codex: exhausted until"), "{:?}", meta.note);
+        assert!(report.starts_with("Rotated past: codex: exhausted until") && report.ends_with("GROK DONE"), "{report}");
+        assert!(w.repo.join("grok-ran").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn worker_fails_when_every_agent_is_out() {
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (codex_limit, grok_limit) = (quota::test_support::CODEX_LIMIT, quota::test_support::GROK_LIMIT);
+        let _w = worker(Mode::ReadOnly, &format!("printf '%s\\n' '{codex_limit}' >&2; exit 1"), &format!("printf '%s\\n' '{grok_limit}' >&2; exit 1"));
+        let (meta, report) = finish().await;
+        assert_eq!(meta.status, Status::Failed);
+        assert!(report.starts_with("No handoff agent is available:"), "{report}");
+        assert!(report.contains("- codex: exhausted until") && report.contains("- grok: exhausted until"), "{report}");
+        assert_eq!(meta.note, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn worker_does_not_rotate_after_files_changed() {
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let limit = quota::test_support::CODEX_LIMIT;
+        let w = worker(Mode::Write, &format!("echo half > half-done.txt; printf '%s\\n' '{limit}' >&2; exit 1"), GROK_OK);
+        let (meta, report) = finish().await;
+        assert_eq!(meta.status, Status::Failed, "{report}");
+        assert_eq!(meta.agent, Agent::Codex);
+        assert!(report.contains("hit its quota after changing files"), "{report}");
+        assert!(!report.contains("Rotated past") && meta.note.is_none(), "{report}");
+        assert!(w.repo.join("half-done.txt").exists());
+        assert!(!w.repo.join("grok-ran").exists());
     }
 }

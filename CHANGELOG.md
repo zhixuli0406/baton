@@ -5,7 +5,7 @@
 ## [Unreleased]
 
 ### Added
-- 額度探針：`baton quota [--refresh]` 與 MCP 工具 `quota_status`。Codex 透過 `codex app-server` 的 `account/rateLimits/read` 即時查詢（不耗額度），Grok 沒有額度 API，只在呼叫因額度失敗後標為用完。狀態存於 `~/.baton/quota.json`。
+- 額度探針：`baton quota [--refresh]` 與 MCP 工具 `quota_status`。Codex 透過 `codex app-server` 的 `account/rateLimits/read` 即時查詢（不耗額度，同一個 MCP server 內的並行呼叫共用一次探測），Grok 沒有額度 API，只在呼叫因額度失敗後標為用完。狀態存於 `~/.baton/quota.json`。
 - 自動輪替：MCP 工具 `delegate` 依 `[rotation] order`（預設 codex → grok）跳過額度用完的廠商，呼叫中撞額度就換下一家；全部用完時回 `DELEGATES_EXHAUSTED`，由 Claude 自己做。模型與推理深度依 `kind`（code／security／research）與 `difficulty`（easy／normal／hard）決定。`write` 模式下 agent 已改檔才撞額度時不換人。額度錯誤只從 CLI stderr 的最後 5 行判斷，避免 agent 讀到的檔案內容造成誤判；`refresh` 會清掉 Grok 的額度錯誤紀錄。
 - 授權：MIT OR Apache-2.0 雙授權（`LICENSE-MIT`、`LICENSE-APACHE`）。
 - `[rotation]` 設定：`enabled`、`order`、`probe_ttl_secs`、`cooldown_secs`。

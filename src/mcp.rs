@@ -663,22 +663,23 @@ async fn run_delegated(parsed: &DelegateArgs, step: &routing::Step, config: &Con
         Err(e) => e,
     };
     let fell_over = matches!(e.1, ErrorKind::Quota | ErrorKind::Unavailable);
-    if e.1 == ErrorKind::Quota {
-        let st = quota::record_quota_error(step.agent, &e.0, &config.rotation).await;
-        skipped.push(quota::describe(&st, chrono::Utc::now().timestamp()));
-    }
+    let state = match e.1 {
+        ErrorKind::Quota => {
+            let st = quota::record_quota_error(step.agent, &e.0, &config.rotation).await;
+            quota::describe(&st, chrono::Utc::now().timestamp())
+        }
+        _ => format!("{}: CLI not available ({})", step.agent.name(), e.0.lines().next().unwrap_or(e.0.as_str())),
+    };
     // Rotate only over an untouched tree; never stack a second vendor's edits on a half-done change.
     let touched = before.is_some_and(|b| b.is_none() || b != paths::worktree_fingerprint(&req.cwd));
     let why = match (fell_over, touched) {
         (true, false) => {
-            if e.1 == ErrorKind::Unavailable {
-                let line = e.0.lines().next().unwrap_or(e.0.as_str());
-                skipped.push(format!("{}: CLI not available ({line})", step.agent.name()));
-            }
+            skipped.push(state);
             return StepOutcome::Next;
         }
+        // This agent ran, so it is reported here rather than in `skipped`.
         (true, true) => format!(
-            "Not handed to another agent: the working tree changed while {} ran, before it failed. Review it (git status / git diff) and decide how to continue.",
+            "{state}\nNot handed to another agent: the working tree changed while {} ran, before it failed. Review it (git status / git diff) and decide how to continue.",
             step.agent.name()
         ),
         (false, _) if req.mode == Mode::Write => "Not retried on another agent because this one may already have changed files.".to_string(),
@@ -1125,17 +1126,7 @@ mod tests {
         assert_eq!(cap("short", 10, "n"), "short");
     }
 
-    const CODEX_LIMIT: &str = "ERROR: You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at Nov 4th, 2026 2:38 PM.";
-    const GROK_LIMIT: &str = r#"Error: Internal error: { "message": "API error (status 402 Payment Required): Grok Build usage balance exhausted", "http_status": 402 }"#;
-
-    #[cfg(unix)]
-    fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let p = dir.join(name);
-        std::fs::write(&p, body).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        p
-    }
+    use quota::test_support::{probe_result, script, CODEX_LIMIT, GROK_LIMIT};
 
     /// Fake CLIs and a private BATON_HOME; the guards restore the env on drop.
     #[cfg(unix)]
@@ -1160,19 +1151,6 @@ mod tests {
             paths::EnvVar::set("BATON_GROK_BIN", &grok),
         ];
         Fakes { _vars: vars, dir }
-    }
-
-    fn probe_result(used: u32, reached: bool) -> Value {
-        let resets = chrono::Utc::now().timestamp() + 86_400;
-        json!({
-            "ordinaryUsageAllowed": !reached,
-            "rateLimits": {
-                "primary": {"usedPercent": used, "windowDurationMins": 10080, "resetsAt": resets},
-                "credits": {"hasCredits": false, "unlimited": false},
-                "planType": "promax",
-                "rateLimitReachedType": if reached { json!("rate_limit_reached") } else { Value::Null }
-            }
-        })
     }
 
     fn text_of(v: &Value) -> (String, bool) {
@@ -1237,6 +1215,7 @@ mod tests {
         let (text, err) = text_of(&call_delegate(&json!({"task":"x","mode":"write"}), &repo, &Config::default()).await);
         assert!(err, "{text}");
         assert!(text.contains("Not handed to another agent: the working tree changed while codex ran"), "{text}");
+        assert!(!text.contains("skipped:"), "{text}");
         assert!(!text.contains("SHOULD NOT RUN"), "{text}");
         assert!(repo.join("half-done.txt").exists());
     }
