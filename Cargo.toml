@@ -1,0 +1,26 @@
+[package]
+name = "baton"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Let Claude Code delegate to Codex/Grok by capability and hand work over when Claude hits its usage limit"
+publish = false
+
+[[bin]]
+name = "baton"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "time", "sync", "signal"] }
+toml = "0.8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

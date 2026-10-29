@@ -1,0 +1,11 @@
+{"type":"permission-mode","permissionMode":"default"}
+{"type":"user","message":{"role":"user","content":"Add a --verbose flag to the CLI"}}
+{"type":"user","isMeta":true,"message":{"role":"user","content":"Caveat: meta"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"I'll add the flag."},{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/repo/src/main.rs","old_string":"a","new_string":"b"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}
+{"type":"user","isCompactSummary":true,"message":{"role":"user","content":"Earlier: we set up clap."}}
+{"type":"user","message":{"role":"user","content":"<command-name>/model</command-name>"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"TodoWrite","input":{"todos":[{"content":"add flag","status":"completed"},{"content":"update README","status":"in_progress"}]}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"also update the README"}]}}
+{"type":"assistant","isSidechain":true,"message":{"role":"assistant","content":[{"type":"text","text":"subagent noise"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Now updating README."},{"type":"tool_use","id":"t3","name":"Write","input":{"file_path":"/repo/README.md","content":"x"}},{"type":"tool_use","id":"t4","name":"Edit","input":{"file_path":"/repo/src/main.rs","old_string":"b","new_string":"c"}}]}}
