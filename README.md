@@ -220,4 +220,9 @@ cargo clippy --all-targets -- -D warnings
 
 ## License
 
-尚未決定。
+雙授權，任選其一：
+
+- [Apache License 2.0](LICENSE-APACHE)
+- [MIT License](LICENSE-MIT)
+
+除非你另外明確聲明，你提交給本專案的貢獻都依上述雙授權釋出，不附加其他條款。

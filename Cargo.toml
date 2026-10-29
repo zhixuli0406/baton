@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Let Claude Code delegate to Codex/Grok by capability and hand work over when Claude hits its usage limit"
+license = "MIT OR Apache-2.0"
 publish = false
 
 [[bin]]
