@@ -1204,7 +1204,7 @@ mod tests {
         assert!(text.contains("- codex: exhausted until") && text.contains("- grok: exhausted until"), "{text}");
         assert!(text.contains("do this task yourself"), "{text}");
         let grok = quota::cached(Agent::Grok).unwrap();
-        assert_eq!((grok.state, grok.source.as_str()), (quota::State::Exhausted, "error"));
+        assert_eq!((grok.state, grok.source), (quota::State::Exhausted, quota::Source::Error));
         // The recorded block now short-circuits a pinned call without running grok.
         let p = json!({"name":"ask_grok","arguments":{"task":"x"}});
         let (text, err) = text_of(&call_tool(&p, f.dir.path()).await.unwrap());
@@ -1221,7 +1221,7 @@ mod tests {
         assert!(!err, "{text}");
         assert!(text.contains("delegate → grok") && text.contains("skipped: codex: exhausted until"), "{text}");
         let codex = quota::cached(Agent::Codex).unwrap();
-        assert_eq!((codex.state, codex.source.as_str()), (quota::State::Exhausted, "error"));
+        assert_eq!((codex.state, codex.source), (quota::State::Exhausted, quota::Source::Error));
     }
 
     #[cfg(unix)]

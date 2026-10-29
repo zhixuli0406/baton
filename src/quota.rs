@@ -26,6 +26,28 @@ pub enum State {
     Unknown,
 }
 
+/// Where a status came from. Serialized as `probe` / `error` / `none`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Source {
+    /// A live Codex rate-limit probe.
+    Probe,
+    /// A call that failed on quota.
+    Error,
+    /// Nothing known (Grok before any failure).
+    None,
+}
+
+impl Source {
+    pub fn name(self) -> &'static str {
+        match self {
+            Source::Probe => "probe",
+            Source::Error => "error",
+            Source::None => "none",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Window {
     /// `"primary"` or `"secondary"`.
@@ -39,7 +61,7 @@ pub struct Window {
 pub struct Status {
     pub agent: Agent,
     pub state: State,
-    pub source: String,
+    pub source: Source,
     pub checked_at: i64,
     pub until: Option<i64>,
     pub plan: Option<String>,
@@ -154,7 +176,7 @@ fn codex_status(state: State, now: i64, until: Option<i64>, plan: Option<String>
     Status {
         agent: Agent::Codex,
         state,
-        source: "probe".into(),
+        source: Source::Probe,
         checked_at: now,
         until,
         plan,
@@ -177,7 +199,7 @@ pub fn describe(s: &Status, now: i64) -> String {
             return format!("{name}: exhausted until {} ({})", fmt_ts(until), paren(s, now));
         }
     }
-    if s.state == State::Unknown && s.source == "none" {
+    if s.state == State::Unknown && s.source == Source::None {
         return format!("{name}: unknown (no quota API; marked exhausted only after a failed call)");
     }
     let word = match s.state {
@@ -189,7 +211,7 @@ pub fn describe(s: &Status, now: i64) -> String {
 }
 
 fn paren(s: &Status, now: i64) -> String {
-    let mut parts = vec![format!("{}, {}m ago", s.source, age_mins(s.checked_at, now))];
+    let mut parts = vec![format!("{}, {}m ago", s.source.name(), age_mins(s.checked_at, now))];
     match s.state {
         State::Available => parts.push(available_clause(s)),
         _ => {
@@ -266,7 +288,7 @@ fn grok_unknown() -> Status {
     Status {
         agent: Agent::Grok,
         state: State::Unknown,
-        source: "none".into(),
+        source: Source::None,
         checked_at: unix_now(),
         until: None,
         plan: None,
@@ -427,7 +449,7 @@ async fn refresh_codex(cfg: &RotationConfig) -> Status {
         Err(e) => Status {
             agent: Agent::Codex,
             state: State::Unknown,
-            source: "probe".into(),
+            source: Source::Probe,
             checked_at: unix_now(),
             until: None,
             plan: None,
@@ -473,7 +495,7 @@ pub async fn record_quota_error(agent: Agent, error_text: &str, cfg: &RotationCo
     let st = Status {
         agent,
         state: State::Exhausted,
-        source: "error".into(),
+        source: Source::Error,
         checked_at: now,
         until: Some(after(now, block)),
         plan: None,
@@ -595,7 +617,7 @@ mod tests {
         assert_eq!(exhausted.state, State::Exhausted);
         assert_eq!(exhausted.until, Some(1793774326));
         assert_eq!(exhausted.plan.as_deref(), Some("promax"));
-        assert_eq!(exhausted.source, "probe");
+        assert_eq!(exhausted.source, Source::Probe);
         assert_eq!(exhausted.windows.len(), 1);
         assert_eq!(exhausted.windows[0].label, "primary");
         assert_eq!(exhausted.windows[0].used_percent, 100.0);
@@ -732,7 +754,7 @@ mod tests {
         let grok = Status {
             agent: Agent::Grok,
             state: State::Unknown,
-            source: "none".into(),
+            source: Source::None,
             checked_at: now,
             until: None,
             plan: None,
@@ -776,7 +798,7 @@ mod tests {
         let marker = Status {
             agent: Agent::Codex,
             state: State::Available,
-            source: "probe".into(),
+            source: Source::Probe,
             checked_at: unix_now(),
             until: None,
             plan: None,
@@ -796,27 +818,37 @@ mod tests {
 
         let grok = check(Agent::Grok, &cfg).await;
         assert_eq!(grok.state, State::Unknown);
-        assert_eq!(grok.source, "none");
+        assert_eq!(grok.source, Source::None);
         assert!(cached(Agent::Grok).is_none());
 
         let marked = record_quota_error(Agent::Grok, "ignored\nERROR: usage limit hit\n", &cfg).await;
         assert_eq!(marked.state, State::Exhausted);
-        assert_eq!(marked.source, "error");
+        assert_eq!(marked.source, Source::Error);
         assert_eq!(marked.until, Some(marked.checked_at + cfg.cooldown_secs as i64));
         assert!(marked.detail.contains("usage limit"));
         assert!(is_blocked(&cached(Agent::Grok).unwrap(), marked.checked_at));
 
         let codex_err = record_quota_error(Agent::Codex, "usage limit hit", &cfg).await;
         assert_eq!(codex_err.state, State::Exhausted);
-        assert_eq!(codex_err.source, "error");
-        assert_eq!(cached(Agent::Codex).unwrap().source, "error");
+        assert_eq!(codex_err.source, Source::Error);
+        assert_eq!(cached(Agent::Codex).unwrap().source, Source::Error);
 
         // A failed probe keeps a block that has not run out; refresh clears grok's error block.
-        assert_eq!(check(Agent::Codex, &stale).await.source, "error");
+        assert_eq!(check(Agent::Codex, &stale).await.source, Source::Error);
         assert!(is_blocked(&check(Agent::Grok, &stale).await, unix_now()));
         let cleared = refresh(Agent::Grok, &cfg).await;
-        assert_eq!((cleared.state, cleared.source.as_str()), (State::Unknown, "none"));
+        assert_eq!((cleared.state, cleared.source), (State::Unknown, Source::None));
         assert!(cached(Agent::Grok).is_none());
+    }
+
+    #[test]
+    fn source_keeps_its_on_disk_names() {
+        let v = json!({"agent":"grok","state":"exhausted","source":"error","checked_at":1,"until":2,"plan":null,"windows":[],"detail":"x"});
+        let st: Status = serde_json::from_value(v).unwrap();
+        assert_eq!(st.source, Source::Error);
+        for src in [Source::Probe, Source::Error, Source::None] {
+            assert_eq!(serde_json::to_value(src).unwrap(), json!(src.name()));
+        }
     }
 
     #[test]
