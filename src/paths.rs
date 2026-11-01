@@ -40,6 +40,10 @@ pub fn quota_file() -> PathBuf {
     baton_home().join("quota.json")
 }
 
+pub fn resets_log() -> PathBuf {
+    baton_home().join("resets.jsonl")
+}
+
 pub fn events_log() -> PathBuf {
     baton_home().join("events.jsonl")
 }

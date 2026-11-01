@@ -401,12 +401,17 @@ async fn run_rotation(meta: &mut Meta, config: &Config, brief: &str, stop: &mut 
     let original = meta.agent;
     let task = format!("{PROMPT_INTRO}<handoff_data>\n{brief}\n</handoff_data>{PROMPT_RULES}");
     let mut skips = Vec::new();
+    let mut may_redeem = true;
     for agent in rotation_order(original, config) {
         let now = chrono::Utc::now().timestamp();
-        let st = quota::check(agent, &config.rotation).await;
+        let st = if may_redeem { quota::ensure(agent, &config.rotation).await } else { quota::check(agent, &config.rotation).await };
+        may_redeem &= st.redeemed.is_none();
         if quota::is_blocked(&st, now) {
             skips.push(quota::describe(&st, now));
             continue;
+        }
+        if let Some(note) = &st.redeemed {
+            eprintln!("note: {note}");
         }
         if agent != original {
             meta.agent = agent;
@@ -423,31 +428,44 @@ async fn run_rotation(meta: &mut Meta, config: &Config, brief: &str, stop: &mut 
             effort: None,
             timeout: Duration::from_secs(meta.timeout_secs),
         };
-        let fingerprint = (meta.mode == Mode::Write).then(|| paths::worktree_fingerprint(&meta.cwd));
-        let result = tokio::select! {
-            r = agents::run(&req) => Some(r),
-            _ = stop.recv() => None,
-        };
-        // Rotate only over an untouched tree; never stack a second vendor's edits on a half-done change.
-        let touched = || fingerprint.as_ref().is_some_and(|b| b.is_none() || *b != paths::worktree_fingerprint(&meta.cwd));
-        match result {
-            Some(Ok(o)) => return Ok((RotationEnd::Done(o.text), skips)),
-            Some(Err(e)) if e.1 == agents::ErrorKind::Quota => {
-                let st = quota::record_quota_error(agent, &e.0, &config.rotation).await;
-                let state = quota::describe(&st, chrono::Utc::now().timestamp());
-                if touched() {
-                    // Not a skip: this agent did run, so the report must not claim a rotation past it.
-                    let why = format!("{e}\n\n{state}\n{} hit its quota after changing files, so the handoff was not rotated to another agent. Review the working tree before continuing.", agent.name());
-                    return Ok((RotationEnd::Failed(why), skips));
+        for attempt in 0..2 {
+            let fingerprint = (meta.mode == Mode::Write).then(|| paths::worktree_fingerprint(&meta.cwd));
+            let result = tokio::select! {
+                r = agents::run(&req) => Some(r),
+                _ = stop.recv() => None,
+            };
+            // Rotate only over an untouched tree; never stack a second vendor's edits on a half-done change.
+            let touched = || fingerprint.as_ref().is_some_and(|b| b.is_none() || *b != paths::worktree_fingerprint(&meta.cwd));
+            match result {
+                Some(Ok(o)) => return Ok((RotationEnd::Done(o.text), skips)),
+                Some(Err(e)) if e.1 == agents::ErrorKind::Quota => {
+                    let st = quota::record_quota_error(agent, &e.0, &config.rotation).await;
+                    let st = if attempt == 0 && may_redeem { quota::redeem_if_exhausted(st, &config.rotation).await } else { st };
+                    may_redeem &= st.redeemed.is_none();
+                    let restored = st.state == quota::State::Available;
+                    if let Some(note) = &st.redeemed {
+                        eprintln!("note: {note}");
+                    }
+                    let state = quota::describe(&st, chrono::Utc::now().timestamp());
+                    if touched() {
+                        // Not a skip: this agent did run, so the report must not claim a rotation past it.
+                        let restored_note = if restored { " Quota was restored." } else { "" };
+                        let why = format!("{e}\n\n{state}{restored_note}\n{} hit its quota after changing files, so the handoff was not rotated to another agent. Review the working tree before continuing.", agent.name());
+                        return Ok((RotationEnd::Failed(why), skips));
+                    }
+                    if restored && attempt == 0 {
+                        continue;
+                    }
+                    skips.push(state);
                 }
-                skips.push(state);
+                Some(Err(e)) if e.1 == agents::ErrorKind::Unavailable && !touched() => {
+                    let line = e.0.lines().next().unwrap_or(e.0.as_str());
+                    skips.push(format!("{}: CLI not available ({line})", agent.name()));
+                }
+                Some(Err(e)) => return Ok((RotationEnd::Failed(e.to_string()), skips)),
+                None => return Ok((RotationEnd::Stopped, skips)),
             }
-            Some(Err(e)) if e.1 == agents::ErrorKind::Unavailable && !touched() => {
-                let line = e.0.lines().next().unwrap_or(e.0.as_str());
-                skips.push(format!("{}: CLI not available ({line})", agent.name()));
-            }
-            Some(Err(e)) => return Ok((RotationEnd::Failed(e.to_string()), skips)),
-            None => return Ok((RotationEnd::Stopped, skips)),
+            break;
         }
     }
     Ok((RotationEnd::NoneAvailable, skips))
@@ -764,4 +782,68 @@ mod tests {
         assert!(w.repo.join("half-done.txt").exists());
         assert!(!w.repo.join("grok-ran").exists());
     }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn worker_redeems_without_reporting_a_rotation() {
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for mid_call in [false, true] {
+            for touch_tree in [false, true] {
+                use quota::test_support::{probe_result, reset_codex, script};
+                let w = worker(Mode::Write, "exit 1", GROK_OK);
+                let root = w._dir.path();
+                let mut probe = probe_result(100, true);
+                probe["rateLimitResetCredits"] = serde_json::json!({"availableCount":1,"credits":[{"id":"reset-one","status":"available","resetType":"codexRateLimits","expiresAt":null}]});
+                let probe_bin = script(root, "reset-probe", &reset_codex(root, &probe, "reset"));
+                let touched = if touch_tree { "echo half > half-done.txt\n" } else { "" };
+                let codex = script(root, "reset-exec", &format!("#!/bin/sh\nif [ \"$1\" != app-server ]; then\n  echo run >> '{}'\n{touched}fi\nexec '{}' \"$@\"\n", root.join("exec-count").display(), probe_bin.display()));
+                let _codex = paths::EnvVar::set("BATON_CODEX_BIN", &codex);
+                if mid_call {
+                    quota::record(&quota::parse_codex(&probe_result(13, false), chrono::Utc::now().timestamp(), 3600));
+                }
+                let (meta, report) = finish().await;
+                let stopped = mid_call && touch_tree;
+                assert_eq!(meta.status, if stopped { Status::Failed } else { Status::Done }, "{report}");
+                assert_eq!(meta.agent, Agent::Codex);
+                assert!(meta.note.is_none() && !report.contains("Rotated past"), "{report}");
+                assert!(!w.repo.join("grok-ran").exists());
+                if stopped {
+                    assert!(report.contains("Quota was restored") && report.contains("hit its quota after changing files"), "{report}");
+                }
+                assert_eq!(std::fs::read_to_string(root.join("exec-count")).unwrap().lines().count(), if mid_call && !touch_tree { 2 } else { 1 });
+                assert_eq!(std::fs::read_to_string(root.join("consume-params")).unwrap().lines().count(), 1);
+            }
+        }
+    }
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn worker_spends_once_after_gate_or_retry_then_rotates() {
+        use quota::test_support::{probe_result, reset_codex, script};
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for mid_call in [false, true] {
+            let w = worker(Mode::ReadOnly, "exit 1", GROK_OK);
+            let root = w._dir.path();
+            let mut probe = probe_result(100, true);
+            probe["rateLimitResetCredits"] = serde_json::json!({"availableCount":2,"credits":[
+                {"id":"one","status":"available","resetType":"codexRateLimits","expiresAt":null},
+                {"id":"two","status":"available","resetType":"codexRateLimits","expiresAt":null}
+            ]});
+            let bin = script(root, "reset-again", &reset_codex(root, &probe, "quota-again"));
+            let codex = script(root, "count-exec", &format!("#!/bin/sh\nif [ \"$1\" != app-server ]; then echo run >> '{}'; fi\nexec '{}' \"$@\"\n", root.join("exec-count").display(), bin.display()));
+            let _codex = paths::EnvVar::set("BATON_CODEX_BIN", &codex);
+            if mid_call {
+                quota::record(&quota::parse_codex(&probe_result(13, false), chrono::Utc::now().timestamp(), 3600));
+            }
+            let (meta, report) = finish().await;
+            assert_eq!(meta.status, Status::Done, "{report}");
+            assert_eq!(meta.agent, Agent::Grok);
+            assert!(w.repo.join("grok-ran").exists());
+            assert_eq!(std::fs::read_to_string(root.join("consume-params")).unwrap().lines().count(), 1);
+            assert_eq!(std::fs::read_to_string(root.join("exec-count")).unwrap().lines().count(), if mid_call { 2 } else { 1 });
+            assert_eq!(quota::cached(Agent::Codex).unwrap().reset_credits, 1);
+        }
+    }
+
 }

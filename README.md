@@ -41,11 +41,15 @@ baton install --apply    # 寫入設定並註冊 MCP server
 分工是這樣：Claude 負責跟你溝通、規劃和派工，Codex 是主要的實作者，Grok 是備援，兩家都沒額度時才由 Claude 自己寫。Claude 呼叫 `delegate` 時，baton 照這個順序走：
 
 1. 先查 Codex 額度。baton 啟動 `codex app-server` 呼叫 `account/rateLimits/read`，這個查詢不耗額度，約 1.6 秒。結果快取 5 分鐘（`probe_ttl_secs`）；同一個 Claude Code session 裡同時有好幾個派工時，只有第一個會去探測，其餘直接用它的結果。
-2. Codex 額度用完就跳過，改叫 Grok。Grok CLI 沒有額度查詢 API，所以 baton 只能在 Grok 呼叫失敗、錯誤訊息看起來是額度問題時（例如 `402 Payment Required: Grok Build usage balance exhausted`），把它標為用完，封鎖 1 小時（`cooldown_secs`）。
-3. 探針說還有額度，但實際呼叫時撞到額度上限（ChatGPT 端的額度狀態偶爾會跟實際不一致），baton 會記錄下來，換下一家重跑同一個任務。這種情況只封鎖到下一次該探測的時候（`probe_ttl_secs`），之後再以探針為準。探針本身失敗時，尚未到期的封鎖會保留。
+2. Codex 額度用完時先嘗試重置券（見下方）；仍不能用才跳過，改叫 Grok。Grok CLI 沒有額度查詢 API，所以 baton 只能在 Grok 呼叫失敗、錯誤訊息看起來是額度問題時（例如 `402 Payment Required: Grok Build usage balance exhausted`），把它標為用完，封鎖 1 小時（`cooldown_secs`）。
+3. 探針說還有額度，但實際呼叫時撞到額度上限（ChatGPT 端的額度狀態偶爾會跟實際不一致），baton 會記錄下來；Codex 成功恢復額度且未改檔時，重試同一步一次，否則依下方規則停止或換下一家。探針與呼叫不一致時只封鎖到下一次該探測的時候（`probe_ttl_secs`），之後再以探針為準。探針本身失敗時，尚未到期的封鎖會保留。
 4. 兩家都不能用時，回覆以 `DELEGATES_EXHAUSTED` 開頭，列出各家狀態與重置時間，Claude 收到後自己做。
 
 額度判斷只看 CLI 結束時 stderr 的最後 5 行，比對「usage limit」「402 Payment Required」「429」這類具體片語，不看 agent 的回覆內文。`codex exec` 會把整段執行過程（包含讀到的檔案內容）寫到 stderr，所以只看結尾；這樣 agent 讀到或審查限流相關的程式碼時，不會被誤判成撞額度。
+
+Codex 用完額度時，`delegate`、`ask_codex` 與接手 worker 預設會先嘗試兌換一張可用的額度重置券，恢復後繼續用 Codex。**重置券會自動花掉，而且無法撤回**；不想自動兌換，在 `[rotation]` 設定 `auto_reset = false`。`reset_min_wait_secs` 預設 3600：距離自然重置不到一小時就保留券，照原本規則輪替或回錯誤。工作區的額度／支出限制不會用個人券處理。
+
+多個 baton 程序共用兌換鎖與同一額度視窗的冪等鍵，每次嘗試在送出兌換前先寫一行 `pending`，結束後再寫一行最終結果，記在 `~/.baton/resets.jsonl`，兩行共用券 ID 與冪等鍵。只有 `pending` 而沒有最終結果，表示結果未知。每個工作最多兌換一張券，包含各步驟與重試。呼叫中撞額度而成功恢復時，`delegate` 與接手 worker 只在工作樹未改動時重試同一步一次；`ask_codex` 會提示再呼叫一次，不自動重跑。回覆的 `note:` 會說明已兌換，與輪替的 `skipped:` 分開。
 
 `write` 模式有一條額外規則：agent 已經改了檔案才撞額度時，**不會**換下一家接著改，以免兩家的半成品疊在一起。baton 在每次呼叫前後比對 `git status`、`git diff` 和未追蹤檔案的大小與修改時間，有差異就停下，請 Claude 先檢查工作樹。被 `.gitignore` 排除的檔案不列入比對（否則 build 產物也會算成改動），所以 agent 只改了被忽略的檔案時仍會換人。接手（handoff）的背景 worker 也照同一套輪替與停止規則。
 
@@ -65,19 +69,19 @@ baton install --apply    # 寫入設定並註冊 MCP server
 查額度：
 
 ```bash
-baton quota             # 用快取（超過 5 分鐘會重新探測 Codex）
-baton quota --refresh   # 強制重新探測
+baton quota             # 只查詢，用快取（超過 5 分鐘會重新探測 Codex），不花重置券
+baton quota --refresh   # 強制重新探測，仍不花重置券
 ```
 
 ```text
-codex: exhausted until 2026-11-04 14:38 +08:00 (probe, 0m ago; weekly window 100% used; plan promax)
+codex: exhausted until 2026-11-04 14:38 +08:00 (probe, 0m ago; weekly window 100% used; plan promax; 1 reset credit available)
 grok: unknown (no quota API; marked exhausted only after a failed call)
 rotation: enabled, order codex → grok
 ```
 
-MCP 工具 `quota_status`（參數 `refresh`，預設 false）印出同樣內容。
+MCP 工具 `quota_status`（參數 `refresh`，預設 false）印出同樣內容，只查詢，永遠不花重置券。
 
-`ask_codex`／`ask_grok` 不輪替，但也會用到額度紀錄：快取裡記錄該家已用完時直接回錯誤（不會為此去探測），呼叫中撞到額度上限時也會記錄。`ask_*` 和 `delegate` 用同一套快取：超過 `probe_ttl_secs` 就重新探測 Codex，所以加購額度後最多 5 分鐘就會生效。要立刻生效，用 `baton quota --refresh` 或 `quota_status` 搭配 `refresh=true`；對 Grok 來說，這會清掉它的額度錯誤紀錄，下一次呼叫若還是失敗會再記一次。
+`ask_codex`／`ask_grok` 不輪替，但也會用到額度紀錄：該家已用完、且 Codex 無法用重置券恢復時直接回錯誤，呼叫中撞到額度上限時也會記錄。`ask_*` 和 `delegate` 用同一套快取：超過 `probe_ttl_secs` 就重新探測 Codex，所以加購額度後最多 5 分鐘就會生效。要立刻查到最新狀態，用 `baton quota --refresh` 或 `quota_status` 搭配 `refresh=true`；對 Grok 來說，這會清掉它的額度錯誤紀錄，下一次呼叫若還是失敗會再記一次。
 
 ### 指定廠商：ask_codex 與 ask_grok
 
@@ -171,6 +175,8 @@ enabled = true         # false：只用 order 的第一家（接手則只用 [ha
 order = ["codex", "grok"]
 probe_ttl_secs = 300   # Codex 探針結果沿用多久
 cooldown_secs = 3600   # 不知道重置時間時（Grok，或探針失敗），撞額度後封鎖多久
+auto_reset = true      # Codex 用完時自動花重置券，無法撤回；false 停用
+reset_min_wait_secs = 3600 # 距自然重置不到這麼多秒時保留券
 
 [models]               # 選填：各 agent 的預設模型（沒給 model 也沒給 capability 時用）
 # codex = "gpt-6.1-sol"
@@ -206,7 +212,7 @@ user scope 的 MCP server 設定存在各帳號的 `.claude.json` 裡。`account
 
 ### 資料存放
 
-`~/.baton` 權限 0700，裡面的檔案 0600。內容包括呼叫紀錄（`runs/`）、交接單與報告（`handoffs/`）、各家額度狀態（`quota.json`）、hook 事件紀錄（`events.jsonl`，用來比對實際撞額度時 Claude Code 送出的訊息）。
+`~/.baton` 權限 0700，裡面的檔案 0600。內容包括呼叫紀錄（`runs/`）、交接單與報告（`handoffs/`）、各家額度狀態（`quota.json`）、重置券兌換嘗試（`resets.jsonl`，含時間、券 ID、冪等鍵，每次嘗試各有一行 `pending` 與最終結果；只有 `pending` 表示結果未知）、hook 事件紀錄（`events.jsonl`，用來比對實際撞額度時 Claude Code 送出的訊息）。
 
 ## 開發
 

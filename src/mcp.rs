@@ -163,7 +163,7 @@ fn dispatch(msg: &Value) -> Dispatch {
                     "protocolVersion": version,
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "baton", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "Delegate work to other vendors' coding agents (Codex, Grok). They cannot see this conversation: give each call a self-contained task. Choose the agent and model by capability: each ask_* description lists that vendor's models with tags; pass `capability` (e.g. security, frontier, fast, web_search) to let baton pick, or `model` to pin one; `list_models` prints the full table. Defensive security work (vulnerability review, hardening, threat modelling) should go to ask_codex with capability=security. Default to mode=read_only; use write only when the agent should edit files. The handoff_* tools inspect or steer a handoff (another agent continuing the task after Claude hit its usage limit): handoff_list and handoff_show are read-only; handoff_stop and handoff_start change state, so use them only when the user asks. For implementation work prefer `delegate`: it rotates codex → grok by quota and picks model/effort from kind and difficulty; if it returns DELEGATES_EXHAUSTED, do the work yourself. `quota_status` shows remaining quota.",
+                    "instructions": "Delegate work to other vendors' coding agents (Codex, Grok). They cannot see this conversation: give each call a self-contained task. Choose the agent and model by capability: each ask_* description lists that vendor's models with tags; pass `capability` (e.g. security, frontier, fast, web_search) to let baton pick, or `model` to pin one; `list_models` prints the full table. Defensive security work (vulnerability review, hardening, threat modelling) should go to ask_codex with capability=security. Default to mode=read_only; use write only when the agent should edit files. The handoff_* tools inspect or steer a handoff (another agent continuing the task after Claude hit its usage limit): handoff_list and handoff_show are read-only; handoff_stop and handoff_start change state, so use them only when the user asks. For implementation work prefer `delegate`: it rotates codex → grok by quota and picks model/effort from kind and difficulty; if it returns DELEGATES_EXHAUSTED, do the work yourself. `delegate`, ask_* and handoffs may automatically and irreversibly spend a Codex reset credit before skipping it; set rotation.auto_reset=false to disable. `quota_status` shows remaining quota and never spends reset credits.",
                 }
             }))
         }
@@ -239,7 +239,7 @@ const CWD_DESC: &str = "Absolute working directory. Defaults to the directory Cl
 fn delegate_tool(efforts: &[&str]) -> Value {
     json!({
         "name": "delegate",
-        "description": "Preferred way to hand work to another vendor's coding agent with automatic rotation. baton tries agents in the configured order (default codex, then grok), skips any whose usage quota is exhausted (Codex: live probe; Grok: recorded quota errors) and falls through to the next one if a call fails on quota. Model and reasoning effort come from `kind` and `difficulty`, so easy work does not burn the most expensive model. If every agent is out of quota the result starts with DELEGATES_EXHAUSTED: then do the task yourself. Use ask_codex / ask_grok only to pin a specific vendor or model.",
+        "description": "Preferred way to hand work to another vendor's coding agent with automatic rotation. baton tries agents in the configured order (default codex, then grok), skips any whose usage quota is exhausted (Codex: live probe; Grok: recorded quota errors) and falls through to the next one if a call fails on quota. Before skipping Codex it may automatically and irreversibly spend a reset credit (disable with rotation.auto_reset=false); after a quota failure it retries the same step once only if files are untouched. Model and reasoning effort come from `kind` and `difficulty`, so easy work does not burn the most expensive model. If every agent is out of quota the result starts with DELEGATES_EXHAUSTED: then do the task yourself. Use ask_codex / ask_grok only to pin a specific vendor or model.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -539,7 +539,8 @@ async fn call_tool(params: &Value, default_cwd: &std::path::Path) -> Result<Valu
         }
     }
     // Same TTL re-probe as delegate, so a top-up is noticed without a manual refresh.
-    let st = quota::check(args.agent, &config.rotation).await;
+    let st = quota::ensure(args.agent, &config.rotation).await;
+    let may_redeem = st.redeemed.is_none();
     let now = chrono::Utc::now().timestamp();
     if quota::is_blocked(&st, now) {
         return Ok(tool_text(
@@ -566,12 +567,13 @@ async fn call_tool(params: &Value, default_cwd: &std::path::Path) -> Result<Valu
             let body = cap(&o.text, REPLY_CAP_CHARS, &log_note);
             tool_text(
                 &format!(
-                    "[{} · {} · {} · {:.1}s · {}]\n{}",
+                    "[{} · {} · {} · {:.1}s · {}]\n{}{}",
                     req.agent.name(),
                     model_label(&req),
                     req.mode.name(),
                     o.duration_secs,
                     log_note,
+                    note_lines(st.redeemed.as_slice()),
                     body
                 ),
                 false,
@@ -581,10 +583,13 @@ async fn call_tool(params: &Value, default_cwd: &std::path::Path) -> Result<Valu
             let mut body = cap(&e.0, REPLY_CAP_CHARS, &log_note);
             if e.1 == ErrorKind::Quota {
                 let st = quota::record_quota_error(req.agent, &e.0, &config.rotation).await;
-                body.push_str(&format!(
-                    "\n\n{}. Use delegate or the other ask_* tool.",
-                    quota::describe(&st, chrono::Utc::now().timestamp())
-                ));
+                let st = if may_redeem { quota::redeem_if_exhausted(st, &config.rotation).await } else { st };
+                if st.state == quota::State::Available {
+                    let note = st.redeemed.as_deref().unwrap_or("codex: quota restored by another session");
+                    body.push_str(&format!("\n\n{note}. Quota is restored; you may call again after reviewing any file changes."));
+                } else {
+                    body.push_str(&format!("\n\n{}. Use delegate or the other ask_* tool.", quota::describe(&st, chrono::Utc::now().timestamp())));
+                }
             }
             tool_text(
                 &format!("[{} · {} · {} · {}]\n{body}", req.agent.name(), model_label(&req), req.mode.name(), log_note),
@@ -598,6 +603,7 @@ enum StepOutcome {
     Done(Value),
     Stop(Value),
     Next,
+    Retry,
 }
 
 async fn call_delegate(args: &Value, default_cwd: &Path, config: &Config) -> Value {
@@ -618,22 +624,29 @@ async fn call_delegate(args: &Value, default_cwd: &Path, config: &Config) -> Val
     let catalog = config.catalog();
     let steps = routing::plan(parsed.kind, parsed.difficulty, parsed.effort, &catalog, &order);
     let mut skipped = Vec::new();
+    let mut notes = Vec::new();
+    let mut may_redeem = true;
     for step in steps {
         let now = chrono::Utc::now().timestamp();
-        let st = quota::check(step.agent, &config.rotation).await;
+        let st = if may_redeem { quota::ensure(step.agent, &config.rotation).await } else { quota::check(step.agent, &config.rotation).await };
+        may_redeem &= st.redeemed.is_none();
         if quota::is_blocked(&st, now) {
             skipped.push(quota::describe(&st, now));
             continue;
         }
-        match run_delegated(&parsed, &step, config, &mut skipped).await {
-            StepOutcome::Done(v) | StepOutcome::Stop(v) => return v,
-            StepOutcome::Next => {}
+        notes.extend(st.redeemed);
+        for attempt in 0..2 {
+            match run_delegated(&parsed, &step, config, &mut skipped, &mut notes, &mut may_redeem, attempt == 0).await {
+                StepOutcome::Done(v) | StepOutcome::Stop(v) => return v,
+                StepOutcome::Next => break,
+                StepOutcome::Retry => {}
+            }
         }
     }
     tool_text(&exhausted_text(&skipped), true)
 }
 
-async fn run_delegated(parsed: &DelegateArgs, step: &routing::Step, config: &Config, skipped: &mut Vec<String>) -> StepOutcome {
+async fn run_delegated(parsed: &DelegateArgs, step: &routing::Step, config: &Config, skipped: &mut Vec<String>, notes: &mut Vec<String>, may_redeem: &mut bool, allow_retry: bool) -> StepOutcome {
     let req = Request {
         agent: step.agent,
         mode: parsed.mode,
@@ -650,12 +663,13 @@ async fn run_delegated(parsed: &DelegateArgs, step: &routing::Step, config: &Con
     let e = match result {
         Ok(o) => {
             let text = format!(
-                "[delegate → {} · {} · {} · {:.1}s · {log_note}]\n{}{}",
+                "[delegate → {} · {} · {} · {:.1}s · {log_note}]\n{}{}{}",
                 req.agent.name(),
                 model_label(&req),
                 req.mode.name(),
                 o.duration_secs,
                 skipped_line(skipped),
+                note_lines(notes),
                 cap(&o.text, REPLY_CAP_CHARS, &log_note)
             );
             return StepOutcome::Done(tool_text(&text, false));
@@ -663,15 +677,24 @@ async fn run_delegated(parsed: &DelegateArgs, step: &routing::Step, config: &Con
         Err(e) => e,
     };
     let fell_over = matches!(e.1, ErrorKind::Quota | ErrorKind::Unavailable);
+    let mut restored = false;
     let state = match e.1 {
         ErrorKind::Quota => {
             let st = quota::record_quota_error(step.agent, &e.0, &config.rotation).await;
+            let st = if allow_retry && *may_redeem { quota::redeem_if_exhausted(st, &config.rotation).await } else { st };
+            *may_redeem &= st.redeemed.is_none();
+            restored = st.state == quota::State::Available;
+            notes.extend(st.redeemed.clone());
             quota::describe(&st, chrono::Utc::now().timestamp())
         }
         _ => format!("{}: CLI not available ({})", step.agent.name(), e.0.lines().next().unwrap_or(e.0.as_str())),
     };
     // Rotate only over an untouched tree; never stack a second vendor's edits on a half-done change.
     let touched = before.is_some_and(|b| b.is_none() || b != paths::worktree_fingerprint(&req.cwd));
+    if restored && !touched && allow_retry {
+        return StepOutcome::Retry;
+    }
+    let restored_note = if restored { " Quota was restored." } else { "" };
     let why = match (fell_over, touched) {
         (true, false) => {
             skipped.push(state);
@@ -679,21 +702,26 @@ async fn run_delegated(parsed: &DelegateArgs, step: &routing::Step, config: &Con
         }
         // This agent ran, so it is reported here rather than in `skipped`.
         (true, true) => format!(
-            "{state}\nNot handed to another agent: the working tree changed while {} ran, before it failed. Review it (git status / git diff) and decide how to continue.",
+            "{state}{restored_note}\nNot handed to another agent: the working tree changed while {} ran, before it failed. Review it (git status / git diff) and decide how to continue.",
             step.agent.name()
         ),
         (false, _) if req.mode == Mode::Write => "Not retried on another agent because this one may already have changed files.".to_string(),
         (false, _) => "Not retried on another agent: this failure is not a quota or availability problem.".to_string(),
     };
     let text = format!(
-        "[delegate → {} · {} · {} · {log_note}]\n{}{}\n{why}",
+        "[delegate → {} · {} · {} · {log_note}]\n{}{}{}\n{why}",
         req.agent.name(),
         model_label(&req),
         req.mode.name(),
         skipped_line(skipped),
+        note_lines(notes),
         cap(&e.0, REPLY_CAP_CHARS, &log_note)
     );
     StepOutcome::Stop(tool_text(&text, true))
+}
+
+fn note_lines(notes: &[String]) -> String {
+    notes.iter().map(|note| format!("note: {note}\n")).collect()
 }
 
 fn exhausted_text(skipped: &[String]) -> String {
@@ -1219,4 +1247,134 @@ mod tests {
         assert!(!text.contains("SHOULD NOT RUN"), "{text}");
         assert!(repo.join("half-done.txt").exists());
     }
+
+    #[cfg(unix)]
+    fn reset_probe() -> Value {
+        let mut probe = probe_result(100, true);
+        probe["rateLimitResetCredits"] = json!({"availableCount":1,"credits":[{"id":"reset-one","status":"available","resetType":"codexRateLimits","expiresAt":null}]});
+        probe
+    }
+
+    #[cfg(unix)]
+    fn install_reset_codex(f: &Fakes, touch_tree: bool) -> paths::EnvVar {
+        let probe = script(f.dir.path(), "reset-probe", &quota::test_support::reset_codex(f.dir.path(), &reset_probe(), "reset"));
+        let touched = if touch_tree { "echo half > half-done.txt\n" } else { "" };
+        let body = format!("#!/bin/sh\nif [ \"$1\" != app-server ]; then\n  echo run >> '{}'\n{touched}fi\nexec '{}' \"$@\"\n", f.dir.path().join("exec-count").display(), probe.display());
+        let codex = script(f.dir.path(), "reset-exec", &body);
+        paths::EnvVar::set("BATON_CODEX_BIN", &codex)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn delegate_redeems_at_gate_or_retries_same_step_after_quota() {
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for mid_call in [false, true] {
+            let f = fakes(probe_result(13, false), "", "echo SHOULD_NOT_RUN");
+            let _codex = install_reset_codex(&f, false);
+            if mid_call {
+                quota::record(&quota::parse_codex(&probe_result(13, false), chrono::Utc::now().timestamp(), 3600));
+            }
+            let (text, err) = text_of(&call_delegate(&json!({"task":"x"}), f.dir.path(), &Config::default()).await);
+            assert!(!err && text.contains("delegate → codex"), "{text}");
+            assert!(text.contains("note: codex: reset credit redeemed"), "{text}");
+            assert!(!text.contains("skipped:") && !text.contains("SHOULD_NOT_RUN"), "{text}");
+            assert_eq!(std::fs::read_to_string(f.dir.path().join("exec-count")).unwrap().lines().count(), if mid_call { 2 } else { 1 });
+            assert_eq!(std::fs::read_to_string(f.dir.path().join("consume-params")).unwrap().lines().count(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn delegate_restores_quota_but_stops_after_files_changed() {
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let f = fakes(probe_result(13, false), "", "echo SHOULD_NOT_RUN");
+        let _codex = install_reset_codex(&f, true);
+        quota::record(&quota::parse_codex(&probe_result(13, false), chrono::Utc::now().timestamp(), 3600));
+        let repo = f.dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(&repo).status().unwrap().success());
+        let (text, err) = text_of(&call_delegate(&json!({"task":"x","mode":"write"}), &repo, &Config::default()).await);
+        assert!(err && text.contains("Not handed to another agent") && text.contains("Quota was restored"), "{text}");
+        assert!(!text.contains("skipped:") && !text.contains("SHOULD_NOT_RUN"), "{text}");
+        assert_eq!(std::fs::read_to_string(f.dir.path().join("exec-count")).unwrap().lines().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn ask_redeems_without_retry_and_reports_gate_redemption() {
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for mid_call in [false, true] {
+            let f = fakes(probe_result(13, false), "", "echo SHOULD_NOT_RUN");
+            let _codex = install_reset_codex(&f, false);
+            if mid_call {
+                quota::record(&quota::parse_codex(&probe_result(13, false), chrono::Utc::now().timestamp(), 3600));
+            }
+            let (text, err) = text_of(&call_tool(&json!({"name":"ask_codex","arguments":{"task":"x"}}), f.dir.path()).await.unwrap());
+            assert_eq!(err, mid_call, "{text}");
+            assert!(text.contains("reset credit redeemed"), "{text}");
+            assert!(!text.contains("Use delegate"), "{text}");
+            if mid_call {
+                assert!(text.contains("you may call again"), "{text}");
+            } else {
+                assert!(text.contains("note: codex:"), "{text}");
+            }
+            assert_eq!(std::fs::read_to_string(f.dir.path().join("exec-count")).unwrap().lines().count(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn delegate_retries_only_once_when_codex_still_fails() {
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let f = fakes(probe_result(13, false), "", "cat >/dev/null; echo '{\"text\":\"GROK DONE\"}'");
+        let probe = script(f.dir.path(), "reset-probe", &quota::test_support::reset_codex(f.dir.path(), &reset_probe(), "reset"));
+        let codex = script(f.dir.path(), "always-out", &format!("#!/bin/sh\nif [ \"$1\" = app-server ]; then exec '{}' \"$@\"; fi\ncat >/dev/null\necho run >> '{}'\nprintf '%s\\n' '{CODEX_LIMIT}' >&2\nexit 1\n", probe.display(), f.dir.path().join("exec-count").display()));
+        let _codex = paths::EnvVar::set("BATON_CODEX_BIN", &codex);
+        quota::record(&quota::parse_codex(&probe_result(13, false), chrono::Utc::now().timestamp(), 3600));
+        let (text, err) = text_of(&call_delegate(&json!({"task":"x"}), f.dir.path(), &Config::default()).await);
+        assert!(!err && text.contains("delegate → grok") && text.ends_with("GROK DONE"), "{text}");
+        assert!(text.contains("note: codex: reset credit redeemed"), "{text}");
+        assert_eq!(std::fs::read_to_string(f.dir.path().join("exec-count")).unwrap().lines().count(), 2);
+        assert_eq!(std::fs::read_to_string(f.dir.path().join("consume-params")).unwrap().lines().count(), 1);
+    }
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn delegate_and_ask_never_spend_twice_after_gate_or_retry() {
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for ask in [false, true] {
+            for mid_call in [false, true] {
+                let f = fakes(probe_result(13, false), "", &format!("cat >/dev/null; echo '{CODEX_LIMIT}' >&2; exit 1"));
+                let mut probe = reset_probe();
+                probe["rateLimitResetCredits"] = json!({"availableCount":2,"credits":[
+                    {"id":"one","status":"available","resetType":"codexRateLimits","expiresAt":null},
+                    {"id":"two","status":"available","resetType":"codexRateLimits","expiresAt":null}
+                ]});
+                let bin = script(f.dir.path(), "reset-again", &quota::test_support::reset_codex(f.dir.path(), &probe, "quota-again"));
+                let codex = script(f.dir.path(), "count-exec", &format!("#!/bin/sh\nif [ \"$1\" != app-server ]; then echo run >> '{}'; fi\nexec '{}' \"$@\"\n", f.dir.path().join("exec-count").display(), bin.display()));
+                let _codex = paths::EnvVar::set("BATON_CODEX_BIN", &codex);
+                if mid_call {
+                    quota::record(&quota::parse_codex(&probe_result(13, false), chrono::Utc::now().timestamp(), 3600));
+                }
+                let value = if ask {
+                    call_tool(&json!({"name":"ask_codex","arguments":{"task":"x"}}), f.dir.path()).await.unwrap()
+                } else {
+                    let mut config = Config::default();
+                    config.rotation.order = vec![Agent::Codex, Agent::Grok, Agent::Codex];
+                    call_delegate(&json!({"task":"x"}), f.dir.path(), &config).await
+                };
+                let (text, err) = text_of(&value);
+                assert!(err, "{text}");
+                assert!(text.contains(if ask && mid_call { "Quota is restored" } else if ask { "Use delegate" } else { "DELEGATES_EXHAUSTED" }), "{text}");
+                assert_eq!(std::fs::read_to_string(f.dir.path().join("consume-params")).unwrap().lines().count(), 1, "{text}");
+                assert_eq!(std::fs::read_to_string(f.dir.path().join("exec-count")).unwrap().lines().count(), if mid_call && !ask { 2 } else { 1 }, "{text}");
+                assert_eq!(quota::cached(Agent::Codex).unwrap().reset_credits, 1);
+            }
+        }
+    }
+
 }

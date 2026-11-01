@@ -30,6 +30,8 @@ pub struct RotationConfig {
     pub order: Vec<Agent>,
     pub probe_ttl_secs: u64,
     pub cooldown_secs: u64,
+    pub auto_reset: bool,
+    pub reset_min_wait_secs: u64,
 }
 
 impl Default for RotationConfig {
@@ -39,6 +41,8 @@ impl Default for RotationConfig {
             order: vec![Agent::Codex, Agent::Grok],
             probe_ttl_secs: 300,
             cooldown_secs: 3600,
+            auto_reset: true,
+            reset_min_wait_secs: 3600,
         }
     }
 }
@@ -187,21 +191,27 @@ mod tests {
         assert_eq!(c.rotation.order, vec![Agent::Codex, Agent::Grok]);
         assert_eq!(c.rotation.probe_ttl_secs, 300);
         assert_eq!(c.rotation.cooldown_secs, 3600);
+        assert!(c.rotation.auto_reset);
+        assert_eq!(c.rotation.reset_min_wait_secs, 3600);
     }
 
     #[test]
     fn parses_rotation_override() {
-        let c = Config::parse("[rotation]\nenabled = false\norder = [\"grok\"]\nprobe_ttl_secs = 12\ncooldown_secs = 34\n").unwrap();
+        let c = Config::parse("[rotation]\nenabled = false\norder = [\"grok\"]\nprobe_ttl_secs = 12\ncooldown_secs = 34\nauto_reset = false\nreset_min_wait_secs = 56\n").unwrap();
         assert!(!c.rotation.enabled);
         assert_eq!(c.rotation.order, vec![Agent::Grok]);
         assert_eq!(c.rotation.probe_ttl_secs, 12);
         assert_eq!(c.rotation.cooldown_secs, 34);
+        assert!(!c.rotation.auto_reset);
+        assert_eq!(c.rotation.reset_min_wait_secs, 56);
         // Unspecified fields keep the documented defaults, not the type zero.
         let partial = Config::parse("[rotation]\nenabled = false\n").unwrap();
         assert!(!partial.rotation.enabled);
         assert_eq!(partial.rotation.order, vec![Agent::Codex, Agent::Grok]);
         assert_eq!(partial.rotation.probe_ttl_secs, 300);
         assert_eq!(partial.rotation.cooldown_secs, 3600);
+        assert!(partial.rotation.auto_reset);
+        assert_eq!(partial.rotation.reset_min_wait_secs, 3600);
     }
 
     #[test]

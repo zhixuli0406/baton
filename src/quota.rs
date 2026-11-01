@@ -67,6 +67,12 @@ pub struct Status {
     pub plan: Option<String>,
     pub windows: Vec<Window>,
     pub detail: String,
+    #[serde(default)]
+    pub reset_credits: u64,
+    #[serde(default)]
+    pub reset_eligible: bool,
+    #[serde(default, skip_serializing)]
+    pub redeemed: Option<String>,
 }
 
 /// Phrases vendors use when the account is out of quota. Kept specific:
@@ -112,6 +118,17 @@ pub fn stderr_says_quota(stderr: &str) -> bool {
 }
 
 pub fn parse_codex(result: &Value, now: i64, cooldown_secs: u64) -> Status {
+    let mut st = parse_limits(result, now, cooldown_secs);
+    st.reset_credits = result["rateLimitResetCredits"]["availableCount"].as_u64().unwrap_or(0);
+    let reached = result["rateLimits"]["rateLimitReachedType"].as_str();
+    st.reset_eligible = st.state == State::Exhausted && st.reset_credits > 0
+        && matches!(reached, None | Some("rate_limit_reached"))
+        && result["rateLimits"]["spendControlReached"].as_bool() != Some(true)
+        && earliest_reset(&st.windows).is_some();
+    st
+}
+
+fn parse_limits(result: &Value, now: i64, cooldown_secs: u64) -> Status {
     let Some(limits) = result.get("rateLimits").filter(|v| v.is_object()) else {
         return codex_status(State::Unknown, now, None, None, Vec::new(), "probe returned no rateLimits");
     };
@@ -181,6 +198,9 @@ fn codex_status(state: State, now: i64, until: Option<i64>, plan: Option<String>
         until,
         plan,
         windows,
+        reset_credits: 0,
+        reset_eligible: false,
+        redeemed: None,
         detail: detail.to_string(),
     }
 }
@@ -194,7 +214,8 @@ pub fn describe(s: &Status, now: i64) -> String {
     if s.state == State::Exhausted {
         if let Some(until) = s.until {
             if until <= now {
-                return format!("{name}: available again (block expired at {})", fmt_ts(until));
+                let credits = if s.reset_credits > 0 { format!("; {} reset credit{} available", s.reset_credits, if s.reset_credits == 1 { "" } else { "s" }) } else { String::new() };
+                return format!("{name}: available again (block expired at {}{credits})", fmt_ts(until));
             }
             return format!("{name}: exhausted until {} ({})", fmt_ts(until), paren(s, now));
         }
@@ -224,6 +245,9 @@ fn paren(s: &Status, now: i64) -> String {
         if let Some(plan) = &s.plan {
             parts.push(format!("plan {plan}"));
         }
+    }
+    if s.reset_credits > 0 {
+        parts.push(format!("{} reset credit{} available", s.reset_credits, if s.reset_credits == 1 { "" } else { "s" }));
     }
     parts.join("; ")
 }
@@ -293,6 +317,9 @@ fn grok_unknown() -> Status {
         until: None,
         plan: None,
         windows: Vec::new(),
+        reset_credits: 0,
+        reset_eligible: false,
+        redeemed: None,
         detail: "grok has no quota API; marked exhausted only after a failed call".into(),
     }
 }
@@ -302,7 +329,7 @@ pub fn load_all() -> HashMap<String, Status> {
 }
 
 pub fn cached(agent: Agent) -> Option<Status> {
-    load_all().get(agent.name()).cloned()
+    load_all().get(agent.name()).filter(|st| st.agent == agent).cloned()
 }
 
 /// Best effort: a lost write only means the next call probes or fails again.
@@ -379,29 +406,53 @@ fn spawn_probe() -> Result<Child, String> {
     })
 }
 
+struct Session {
+    stdin: tokio::process::ChildStdin,
+    lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    id: u64,
+}
+
+impl Session {
+    fn new(child: &mut Child) -> Result<Self, String> {
+        Ok(Self {
+            stdin: child.stdin.take().ok_or("codex probe has no stdin")?,
+            lines: BufReader::new(child.stdout.take().ok_or("codex probe has no stdout")?).lines(),
+            id: 0,
+        })
+    }
+
+    async fn send(&mut self, msg: Value) -> Result<(), String> {
+        self.stdin.write_all(format!("{msg}\n").as_bytes()).await.map_err(|e| format!("probe write failed: {e}"))?;
+        self.stdin.flush().await.map_err(|e| format!("probe write failed: {e}"))
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.id += 1;
+        self.send(json!({"jsonrpc":"2.0", "id":self.id, "method":method, "params":params})).await?;
+        while let Some(line) = self.lines.next_line().await.map_err(|e| format!("probe read failed: {e}"))? {
+            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            if v.get("id").and_then(Value::as_u64) != Some(self.id) { continue; }
+            if let Some(e) = rpc_error(&v) { return Err(e); }
+            return v.get("result").cloned().ok_or("codex response has no result".into());
+        }
+        Err("codex probe ended without a response".into())
+    }
+
+    async fn initialize(&mut self) -> Result<(), String> {
+        self.id = 1;
+        self.send(probe_messages()[0].clone()).await?;
+        self.send(json!({"jsonrpc":"2.0", "method":"initialized"})).await
+    }
+
+    async fn read(&mut self) -> Result<Value, String> {
+        self.request("account/rateLimits/read", json!({})).await
+    }
+}
+
 async fn read_rate_limits(child: &mut Child) -> Result<Value, String> {
-    let mut stdin = child.stdin.take().ok_or_else(|| "codex probe has no stdin".to_string())?;
-    for msg in probe_messages() {
-        let mut line = msg.to_string();
-        line.push('\n');
-        stdin.write_all(line.as_bytes()).await.map_err(|e| format!("probe write failed: {e}"))?;
-    }
-    stdin.flush().await.map_err(|e| format!("probe write failed: {e}"))?;
-    // Keep stdin open: the real app-server exits on EOF and drops in-flight requests.
-    let _stdin = stdin;
-    let stdout = child.stdout.take().ok_or_else(|| "codex probe has no stdout".to_string())?;
-    let mut lines = BufReader::new(stdout).lines();
-    while let Some(line) = lines.next_line().await.map_err(|e| format!("probe read failed: {e}"))? {
-        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
-        if !v.is_object() || v.get("id").and_then(Value::as_u64) != Some(2) {
-            continue;
-        }
-        if let Some(msg) = rpc_error(&v) {
-            return Err(msg);
-        }
-        return v.get("result").cloned().ok_or_else(|| "codex probe response has no result".to_string());
-    }
-    Err("codex probe ended without a rateLimits response".into())
+    let mut session = Session::new(child)?;
+    session.initialize().await?;
+    session.read().await
 }
 
 fn probe_messages() -> [Value; 3] {
@@ -454,9 +505,148 @@ async fn refresh_codex(cfg: &RotationConfig) -> Status {
             until: None,
             plan: None,
             windows: Vec::new(),
+            reset_credits: 0,
+            reset_eligible: false,
+            redeemed: None,
             detail: format!("probe failed: {e}"),
         },
     }
+}
+
+/// Only execution gates may spend a reset credit.
+pub async fn ensure(agent: Agent, cfg: &RotationConfig) -> Status {
+    let st = check(agent, cfg).await;
+    if agent != Agent::Codex { return st; }
+    redeem_if_exhausted(st, cfg).await
+}
+
+fn needs_reset(st: &Status, cfg: &RotationConfig) -> bool {
+    let now = unix_now();
+    st.agent == Agent::Codex && cfg.auto_reset && st.reset_eligible && is_blocked(st, now)
+        && st.until.is_some_and(|u| u.saturating_sub(now) >= i64::try_from(cfg.reset_min_wait_secs).unwrap_or(i64::MAX))
+}
+
+fn reset_failure(mut st: Status, error: &str) -> Status {
+    st.reset_eligible = false;
+    st.detail.push_str(&format!("; reset credit: {error}"));
+    st.checked_at = unix_now();
+    record(&st);
+    st
+}
+
+/// A shared window key survives timeouts and independent baton processes.
+fn reset_key(result: &Value, st: &Status) -> String {
+    let account = result["accountId"].as_str().filter(|s| {
+        s.len() == 36 && s.bytes().enumerate().all(|(i, c)| {
+            if [8, 13, 18, 23].contains(&i) { c == b'-' } else { c.is_ascii_digit() || (b'a'..=b'f').contains(&c) }
+        })
+    }).unwrap_or("00000000-0000-4000-8000-000000000000");
+    let until = full_reset(&st.windows).or_else(|| earliest_reset(&st.windows)).unwrap_or(0);
+    format!("{}{:012x}", &account[..24], (until as u64) & 0xffffffffffff)
+}
+
+fn pick_credit(result: &Value, now: i64) -> Result<Option<String>, &'static str> {
+    let credits = &result["rateLimitResetCredits"]["credits"];
+    if credits.is_null() { return Ok(None); }
+    let rows = credits.as_array().ok_or("invalid credits list")?;
+    if rows.iter().any(|v| v["status"] == "redeeming") { return Err("a credit is already redeeming"); }
+    rows.iter().filter(|v| v["status"] == "available" && v["resetType"] == "codexRateLimits"
+        && (v["expiresAt"].is_null() || v["expiresAt"].as_i64().is_some_and(|t| t > now)))
+        .filter_map(|v| Some((v["id"].as_str()?, v["expiresAt"].as_i64())))
+        .min_by_key(|(_, expiry)| expiry.unwrap_or(i64::MAX))
+        .map(|(id, _)| Some(id.to_string())).ok_or("no eligible reset credit")
+}
+
+pub async fn redeem_if_exhausted(st: Status, cfg: &RotationConfig) -> Status {
+    if !needs_reset(&st, cfg) { return st; }
+    let original = st.clone();
+    let cfg = cfg.clone();
+    match tokio::spawn(async move { redeem_transaction(st, &cfg).await }).await {
+        Ok(st) => st,
+        Err(e) => reset_failure(original, &format!("reset task failed: {e}")),
+    }
+}
+
+async fn redeem_transaction(st: Status, cfg: &RotationConfig) -> Status {
+    if let Err(e) = paths::ensure_dir(&paths::baton_home()) { return reset_failure(st, &e.to_string()); }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let _lock = loop {
+        match paths::try_lock(&paths::baton_home().join("quota-reset.lock")) {
+            Ok(Some(lock)) => break lock,
+            Ok(None) if tokio::time::Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(100)).await,
+            Ok(None) => return st,
+            Err(e) => return reset_failure(st, &e.to_string()),
+        }
+    };
+    // Second-resolution timestamps can tie; a suppressed or restored peer result still wins.
+    if let Some(peer) = cached(Agent::Codex).filter(|p| p.checked_at >= st.checked_at && (!is_blocked(p, unix_now()) || !p.reset_eligible)) {
+        return peer;
+    }
+    let mut latest = st;
+    let mut attempt = None;
+    let run = reset_session(&mut latest, cfg, &mut attempt);
+    let outcome = match tokio::time::timeout(Duration::from_secs(45), run).await {
+        Ok(result) => result,
+        Err(_) => Err("reset session timed out after 45s".into()),
+    };
+    if let Some(mut audit) = attempt {
+        if audit["outcome"].is_null() {
+            audit["outcome"] = json!(outcome.as_ref().err().map(String::as_str).unwrap_or("unknown outcome"));
+        }
+        if let Err(e) = paths::append_private(&paths::resets_log(), &audit.to_string()) {
+            return reset_failure(latest, &format!("audit write failed: {e}"));
+        }
+    }
+    match outcome {
+        Ok(()) => latest,
+        Err(e) => reset_failure(latest, &e),
+    }
+}
+
+async fn reset_session(latest: &mut Status, cfg: &RotationConfig, attempt: &mut Option<Value>) -> Result<(), String> {
+    let mut child = spawn_probe()?;
+    let _group = crate::agents::GroupGuard(child.id());
+    let mut session = Session::new(&mut child)?;
+    session.initialize().await?;
+    let result = session.read().await?;
+    *latest = parse_codex(&result, unix_now(), cfg.cooldown_secs);
+    record(latest);
+    if !needs_reset(latest, cfg) { return Ok(()); }
+    let credit = pick_credit(&result, unix_now()).map_err(str::to_string)?;
+    let key = reset_key(&result, latest);
+    let mut params = json!({"idempotencyKey":key});
+    if let Some(id) = &credit { params["creditId"] = json!(id); }
+    let mut audit = json!({"ts":unix_now(), "credit_id":credit, "idempotency_key":key,
+        "outcome":"pending", "until":latest.until, "windows":latest.windows, "available_count_before":latest.reset_credits});
+    paths::append_private(&paths::resets_log(), &audit.to_string()).map_err(|e| format!("pending audit write failed: {e}"))?;
+    audit["outcome"] = Value::Null;
+    *attempt = Some(audit);
+    let consumed = session.request("account/rateLimitResetCredit/consume", params).await;
+    let outcome = match consumed {
+        Ok(v) => v["outcome"].as_str().unwrap_or("unknown outcome").to_string(),
+        Err(e) => {
+            attempt.as_mut().unwrap()["outcome"] = json!(&e);
+            return Err(e);
+        }
+    };
+    attempt.as_mut().unwrap()["outcome"] = json!(&outcome);
+    if !matches!(outcome.as_str(), "reset" | "alreadyRedeemed") { return Err(format!("consume returned {outcome}")); }
+    for poll in 0..3 {
+        if poll > 0 { tokio::time::sleep(Duration::from_secs(2)).await; }
+        let result = session.read().await?;
+        let polled = parse_codex(&result, unix_now(), cfg.cooldown_secs);
+        if polled.state == State::Unknown { return Err(format!("{outcome}, but quota poll returned {}", polled.detail)); }
+        *latest = polled;
+        if latest.state != State::Exhausted { break; }
+    }
+    if latest.state != State::Available { return Err(format!("{outcome}, but quota is still {:?}", latest.state)); }
+    record(latest);
+    latest.redeemed = Some(if outcome == "reset" {
+        format!("codex: reset credit redeemed ({} left)", latest.reset_credits)
+    } else {
+        format!("codex: reset credit redeemed by another session ({} left)", latest.reset_credits)
+    });
+    Ok(())
 }
 
 pub async fn check(agent: Agent, cfg: &RotationConfig) -> Status {
@@ -522,6 +712,9 @@ pub async fn record_quota_error(agent: Agent, error_text: &str, cfg: &RotationCo
         until: Some(after(now, block)),
         plan: None,
         windows: Vec::new(),
+        reset_credits: 0,
+        reset_eligible: false,
+        redeemed: None,
         detail: quota_line(error_text),
     };
     record(&st);
@@ -585,6 +778,67 @@ pub(crate) mod test_support {
         })
     }
 
+    #[cfg(unix)]
+    pub fn reset_codex(dir: &Path, result: &Value, outcome: &str) -> String {
+        let state = serde_json::to_string(&dir.join("reset-state").to_string_lossy()).unwrap();
+        let log = serde_json::to_string(&dir.join("consume-params").to_string_lossy()).unwrap();
+        format!(r#"#!/usr/bin/python3
+import json, os, sys, time
+state = {state}
+log = {log}
+result = json.loads({result})
+outcome = {outcome}
+if sys.argv[1] != 'app-server':
+    sys.stdin.read()
+    if outcome == 'quota-again':
+        if os.path.exists(state):
+            os.unlink(state)
+    elif os.path.exists(state):
+        print('codex done')
+        sys.exit(0)
+    print('ERROR: usage limit reached', file=sys.stderr)
+    sys.exit(1)
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get('method')
+    if method == 'initialized':
+        continue
+    reply = {{'id':msg['id'], 'result':{{}}}}
+    if method == 'account/rateLimits/read':
+        value = json.loads(json.dumps(result))
+        spent = len(open(log).readlines()) if os.path.exists(log) else 0
+        value['rateLimitResetCredits']['availableCount'] = max(0, result['rateLimitResetCredits']['availableCount'] - spent)
+        credits = value['rateLimitResetCredits'].get('credits')
+        if isinstance(credits, list):
+            value['rateLimitResetCredits']['credits'] = credits[spent:]
+        if os.path.exists(state) and outcome == 'unknown-poll':
+            reply['result'] = {{}}
+            print(json.dumps(reply), flush=True)
+            continue
+        if os.path.exists(state) and outcome != 'stuck':
+            value['ordinaryUsageAllowed'] = True
+            value['rateLimits']['rateLimitReachedType'] = None
+            for label in ['primary', 'secondary']:
+                if value['rateLimits'].get(label):
+                    value['rateLimits'][label]['usedPercent'] = 0
+        reply['result'] = value
+    if method == 'account/rateLimitResetCredit/consume':
+        with open(log, 'a') as f:
+            f.write(json.dumps(msg['params']) + '\n')
+        if outcome == 'hang':
+            time.sleep(120)
+        if outcome == 'slow-reset':
+            time.sleep(1)
+        if outcome == 'rpc-error':
+            reply = {{'id':msg['id'], 'error':{{'message':'consume RPC failed'}}}}
+        else:
+            if outcome in ['reset', 'alreadyRedeemed', 'stuck', 'unknown-poll', 'slow-reset', 'quota-again']:
+                open(state, 'w').close()
+            reply['result'] = {{'outcome':'reset' if outcome in ['stuck', 'unknown-poll', 'slow-reset', 'quota-again'] else outcome}}
+    print(json.dumps(reply), flush=True)
+"#, state = state, log = log, result = serde_json::to_string(&result.to_string()).unwrap(), outcome = serde_json::to_string(outcome).unwrap())
+    }
+
     /// A `/bin/sh` stand-in for the codex CLI. `app-server` answers
     /// `account/rateLimits/read` with `result_json` asynchronously and, like
     /// the real one, drops the answer when stdin closes first. Any other
@@ -621,6 +875,265 @@ mod tests {
     use super::*;
 
     use super::test_support::CODEX_LIMIT;
+
+    fn reset_fixture() -> Value {
+        let mut v = test_support::probe_result(100, true);
+        v["accountId"] = json!("77f51905-bf9d-4802-b11d-12aa4bf7a783");
+        v["rateLimitResetCredits"] = json!({"availableCount":1,"credits":[{"id":"credit-1", "status":"available", "resetType":"codexRateLimits", "expiresAt":null}]});
+        v
+    }
+
+    fn consume_params(dir: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(dir.join("consume-params")).unwrap_or_default().lines().map(|s| serde_json::from_str(s).unwrap()).collect()
+    }
+
+    #[test]
+    fn reset_keys_follow_the_blocking_window_and_validate_account() {
+        let mut v = reset_fixture();
+        let st = parse_codex(&v, unix_now(), 3600);
+        let key = reset_key(&v, &st);
+        assert_eq!(key, reset_key(&v, &st));
+        assert_eq!(key.len(), 36);
+        assert_eq!(&key[..24], "77f51905-bf9d-4802-b11d-");
+        assert!(key.bytes().enumerate().all(|(i, c)| if [8,13,18,23].contains(&i) { c == b'-' } else { c.is_ascii_hexdigit() }));
+        v["rateLimits"]["primary"]["resetsAt"] = json!(st.until.unwrap() + 1);
+        assert_ne!(key, reset_key(&v, &parse_codex(&v, unix_now(), 3600)));
+        for account in [Value::Null, json!("NOT-A-UUID"), json!("77F51905-bf9d-4802-b11d-12aa4bf7a783")] {
+            v["accountId"] = account;
+            assert!(reset_key(&v, &st).starts_with("00000000-0000-4000-8000-"));
+        }
+        v["rateLimits"]["secondary"] = json!({"usedPercent":100,"resetsAt":st.until.unwrap()+100});
+        let both = parse_codex(&v, unix_now(), 3600);
+        assert!(reset_key(&v, &both).ends_with(&format!("{:012x}", both.until.unwrap())));
+        let mut old = serde_json::to_value(st).unwrap();
+        old.as_object_mut().unwrap().remove("reset_credits");
+        old.as_object_mut().unwrap().remove("reset_eligible");
+        let old: Status = serde_json::from_value(old).unwrap();
+        assert_eq!(old.reset_credits, 0);
+        assert!(!old.reset_eligible);
+        assert!(old.redeemed.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn reset_ensure_and_parallel_calls_spend_once() {
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_home, dir) = home_lock();
+        let v = reset_fixture();
+        let bin = test_support::script(dir.path(), "reset", &test_support::reset_codex(dir.path(), &v, "reset"));
+        let _bin = paths::EnvVar::set("BATON_CODEX_BIN", bin);
+        let cfg = RotationConfig::default();
+        let c = || ensure(Agent::Codex, &cfg);
+        let results = tokio::join!(c(), c(), c(), c(), c());
+        let all = [results.0, results.1, results.2, results.3, results.4];
+        assert!(all.iter().all(|s| s.state == State::Available));
+        assert_eq!(all.iter().filter(|s| s.redeemed.is_some()).count(), 1);
+        let params = consume_params(dir.path());
+        assert_eq!(params, vec![json!({"creditId":"credit-1", "idempotencyKey":reset_key(&v, &parse_codex(&v, unix_now(),3600))})]);
+        let audit = std::fs::read_to_string(paths::resets_log()).unwrap();
+        assert_eq!(audit.lines().count(), 2);
+        let lines: Vec<Value> = audit.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
+        assert_eq!(lines[0]["outcome"], "pending");
+        assert_eq!(lines[0]["credit_id"], lines[1]["credit_id"]);
+        assert_eq!(lines[0]["idempotency_key"], lines[1]["idempotency_key"]);
+        let audit = &lines[1];
+        assert_eq!(audit["outcome"], "reset");
+        assert_eq!(audit["available_count_before"], 1);
+        assert_eq!(audit["windows"].as_array().unwrap().len(), 1);
+        assert_eq!(paths::mode_of(&paths::resets_log(), 0), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn reset_selection_and_non_spending_guards() {
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = RotationConfig::default();
+        let base = reset_fixture();
+        let now = unix_now();
+        let row = |id: &str, status: &str, kind: &str, expiry: Value| json!({"id":id,"status":status,"resetType":kind,"expiresAt":expiry});
+        let rows = json!([
+            row("late","available","codexRateLimits",json!(now+200)),
+            row("expired","available","codexRateLimits",json!(now-1)),
+            row("used","redeemed","codexRateLimits",json!(now+1)),
+            row("unknown","available","unknown",json!(now+1)),
+            row("early","available","codexRateLimits",json!(now+100)),
+            row("forever","available","codexRateLimits",Value::Null)
+        ]);
+        let mut cases = Vec::new();
+        let mut selected = base.clone(); selected["rateLimitResetCredits"]["credits"] = rows;
+        cases.push(("earliest", selected, cfg.clone(), Some(Some("early"))));
+        let mut null = base.clone(); null["rateLimitResetCredits"]["credits"] = Value::Null;
+        cases.push(("null", null, cfg.clone(), Some(None)));
+        let mut empty = base.clone(); empty["rateLimitResetCredits"]["credits"] = json!([]);
+        cases.push(("empty", empty, cfg.clone(), None));
+        let mut redeeming = base.clone(); redeeming["rateLimitResetCredits"]["credits"].as_array_mut().unwrap().push(row("flight","redeeming","unknown",Value::Null));
+        cases.push(("redeeming", redeeming, cfg.clone(), None));
+        let mut disabled = cfg.clone(); disabled.auto_reset = false;
+        cases.push(("disabled", base.clone(), disabled, None));
+        let mut soon = base.clone(); soon["rateLimits"]["primary"]["resetsAt"] = json!(now+300);
+        cases.push(("soon", soon, cfg.clone(), None));
+        for kind in ["workspace_owner_credits_depleted", "workspace_member_credits_depleted", "workspace_owner_usage_limit_reached", "workspace_member_usage_limit_reached"] {
+            let mut v = base.clone(); v["rateLimits"]["rateLimitReachedType"] = json!(kind);
+            cases.push((kind,v,cfg.clone(),None));
+        }
+        let mut spend = base.clone(); spend["rateLimits"]["spendControlReached"] = json!(true);
+        cases.push(("spend",spend,cfg.clone(),None));
+        let mut zero = base.clone(); zero["rateLimitResetCredits"]["availableCount"] = json!(0);
+        cases.push(("zero",zero,cfg.clone(),None));
+        let mut healthy = base.clone(); healthy["rateLimits"]["primary"]["usedPercent"] = json!(10); healthy["rateLimits"]["rateLimitReachedType"] = Value::Null; healthy["ordinaryUsageAllowed"] = json!(true);
+        cases.push(("healthy",healthy,cfg.clone(),None));
+        for (name,v,cfg,want) in cases {
+            let (_home,dir) = home_lock();
+            let bin = test_support::script(dir.path(), "reset", &test_support::reset_codex(dir.path(), &v, "reset"));
+            let _bin = paths::EnvVar::set("BATON_CODEX_BIN", bin);
+            let st = ensure(Agent::Codex,&cfg).await;
+            let params = consume_params(dir.path());
+            match want {
+                Some(id) => {
+                    assert_eq!(params.len(),1,"{name}: {st:?}");
+                    assert_eq!(params[0].get("creditId").and_then(Value::as_str),id,"{name}");
+                    assert_eq!(st.state, State::Available,"{name}");
+                }
+                None => assert!(params.is_empty(),"{name}: {params:?}"),
+            }
+        }
+        // Fast guards cannot spawn even a broken executable.
+        let (_home,_dir) = home_lock();
+        let _bin = paths::EnvVar::set("BATON_CODEX_BIN","/does-not-exist");
+        let mut cfg = cfg;
+        cfg.auto_reset = false;
+        let original = parse_codex(&base,unix_now(),3600);
+        assert_eq!(redeem_if_exhausted(original.clone(),&cfg).await,original);
+        let grok = grok_unknown();
+        assert_eq!(redeem_if_exhausted(grok.clone(),&cfg).await,grok);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn quota_read_only_surfaces_never_consume() {
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_home,dir) = home_lock();
+        let v = reset_fixture();
+        let bin = test_support::script(dir.path(), "reset", &test_support::reset_codex(dir.path(), &v, "reset"));
+        let _bin = paths::EnvVar::set("BATON_CODEX_BIN", bin);
+        let cfg = RotationConfig::default();
+        assert_eq!(check(Agent::Codex,&cfg).await.state,State::Exhausted);
+        assert_eq!(refresh(Agent::Codex,&cfg).await.state,State::Exhausted);
+        assert!(report(&cfg,true).await.contains("1 reset credit available"));
+        assert!(report(&cfg,false).await.contains("1 reset credit available"));
+        assert!(record_quota_error(Agent::Codex,CODEX_LIMIT,&cfg).await.reset_eligible);
+        assert!(consume_params(dir.path()).is_empty());
+        assert!(!paths::resets_log().exists());
+        let mut available = parse_codex(&v, unix_now(),3600);
+        available.state = State::Available;
+        available.reset_credits = 2;
+        assert!(describe(&available,unix_now()).contains("2 reset credits available"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn reset_failures_are_audited_and_suppressed_until_probe() {
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = RotationConfig::default();
+        for outcome in ["noCredit","nothingToReset","rpc-error","unknown-new-outcome","stuck","unknown-poll","hang","alreadyRedeemed"] {
+            let (_home,dir) = home_lock();
+            let v = reset_fixture();
+            let bin = test_support::script(dir.path(), "reset", &test_support::reset_codex(dir.path(), &v, outcome));
+            let _bin = paths::EnvVar::set("BATON_CODEX_BIN", bin);
+            let st = ensure(Agent::Codex,&cfg).await;
+            if outcome == "alreadyRedeemed" {
+                assert_eq!(st.state,State::Available);
+                assert!(st.redeemed.unwrap().contains("another session"));
+            } else {
+                assert_eq!(st.state,State::Exhausted,"{outcome}");
+                assert!(!st.reset_eligible,"{outcome}");
+                assert!(st.detail.contains("reset credit:"),"{outcome}: {}",st.detail);
+                let again = ensure(Agent::Codex,&cfg).await;
+                assert!(!again.reset_eligible);
+            }
+            assert_eq!(consume_params(dir.path()).len(),1,"{outcome}");
+            let audit = std::fs::read_to_string(paths::resets_log()).unwrap();
+            assert_eq!(audit.lines().count(),2,"{outcome}");
+            let lines: Vec<Value> = audit.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
+            assert_eq!(lines[0]["outcome"], "pending");
+            assert_eq!(lines[0]["credit_id"], lines[1]["credit_id"]);
+            assert_eq!(lines[0]["idempotency_key"], lines[1]["idempotency_key"]);
+            let audit = &lines[1];
+            assert!(audit["outcome"].as_str().is_some_and(|s| !s.is_empty()),"{outcome}");
+            if outcome == "hang" { assert!(audit["outcome"].as_str().unwrap().contains("timed out")); }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn grok_ignores_a_codex_status_under_its_cache_key() {
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_home,dir) = home_lock();
+        let v = reset_fixture();
+        let bin = test_support::script(dir.path(), "reset", &test_support::reset_codex(dir.path(), &v, "reset"));
+        let _bin = paths::EnvVar::set("BATON_CODEX_BIN", bin);
+        let st = parse_codex(&v, unix_now(), 3600);
+        std::fs::write(paths::quota_file(), json!({"grok":st}).to_string()).unwrap();
+        assert!(cached(Agent::Grok).is_none());
+        let st = ensure(Agent::Grok, &RotationConfig::default()).await;
+        assert_eq!(st.agent, Agent::Grok);
+        assert_eq!(st.state, State::Unknown);
+        assert!(consume_params(dir.path()).is_empty());
+        assert!(!paths::resets_log().exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn reset_transaction_survives_caller_cancellation() {
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_home,dir) = home_lock();
+        let bin = test_support::script(dir.path(), "reset", &test_support::reset_codex(dir.path(), &reset_fixture(), "slow-reset"));
+        let _bin = paths::EnvVar::set("BATON_CODEX_BIN", bin);
+        let task = tokio::spawn(async { ensure(Agent::Codex, &RotationConfig::default()).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if std::fs::read_to_string(paths::resets_log()).unwrap_or_default().contains("pending") { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let audit = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let audit = std::fs::read_to_string(paths::resets_log()).unwrap();
+                if audit.lines().count() == 2 { break audit; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.unwrap();
+        let lines: Vec<Value> = audit.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
+        assert_eq!(lines[0]["outcome"], "pending");
+        assert_eq!(lines[1]["outcome"], "reset");
+        assert_eq!(lines[0]["credit_id"], lines[1]["credit_id"]);
+        assert_eq!(lines[0]["idempotency_key"], lines[1]["idempotency_key"]);
+        assert_eq!(consume_params(dir.path()).len(), 1);
+        assert_eq!(cached(Agent::Codex).unwrap().state, State::Available);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn pending_audit_failure_spends_nothing() {
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_home,dir) = home_lock();
+        let bin = test_support::script(dir.path(), "reset", &test_support::reset_codex(dir.path(), &reset_fixture(), "reset"));
+        let _bin = paths::EnvVar::set("BATON_CODEX_BIN", bin);
+        std::fs::create_dir(paths::resets_log()).unwrap();
+        let st = ensure(Agent::Codex, &RotationConfig::default()).await;
+        assert!(st.detail.contains("pending audit write failed"), "{st:?}");
+        assert!(!st.reset_eligible);
+        assert!(consume_params(dir.path()).is_empty());
+    }
 
     fn exhausted_fixture() -> Value {
         json!({
@@ -812,6 +1325,9 @@ mod tests {
             until: None,
             plan: None,
             windows: Vec::new(),
+            reset_credits: 0,
+            reset_eligible: false,
+            redeemed: None,
             detail: "grok has no quota API; marked exhausted only after a failed call".into(),
         };
         assert_eq!(describe(&grok, now), "grok: unknown (no quota API; marked exhausted only after a failed call)");
@@ -856,6 +1372,9 @@ mod tests {
             until: None,
             plan: None,
             windows: Vec::new(),
+            reset_credits: 0,
+            reset_eligible: false,
+            redeemed: None,
             detail: "cached-marker".into(),
         };
         record(&marker);
