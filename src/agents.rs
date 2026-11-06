@@ -29,6 +29,7 @@ use tokio::process::Command;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 900;
 pub const MAX_TIMEOUT_SECS: u64 = 3600;
 const STDERR_TAIL_CHARS: usize = 2000;
+const CODEX_COST_OVERRIDES: &[&str] = &["features.multi_agent=false", "features.memories=false"];
 
 const GROK_READ_ONLY_TOOLS: &str = "read_file,grep,list_dir,web_search";
 const GROK_READ_ONLY_DENIED: &str = "search_replace,write,run_terminal_cmd,monitor,task,Delete,use_tool,search_tool,web_fetch";
@@ -180,6 +181,9 @@ pub fn plan(req: &Request, scratch: &Path) -> Plan {
                 args.push("-c".into());
                 args.push(format!("model_reasoning_effort=\"{}\"", e.name()));
             }
+            for value in CODEX_COST_OVERRIDES {
+                args.extend(s(&["-c", value]));
+            }
             args.push("-".into());
             Plan {
                 program: req.agent.program(),
@@ -230,6 +234,7 @@ pub struct Outcome {
     pub text: String,
     pub exit_code: Option<i32>,
     pub duration_secs: f64,
+    pub slot_wait_secs: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,6 +304,7 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R) -> Vec<u8> {
 }
 
 pub async fn run(req: &Request) -> Result<Outcome, AgentError> {
+    let started = Instant::now();
     if !req.cwd.is_dir() {
         return Err(AgentError(format!("cwd is not a directory: {}", req.cwd.display()), ErrorKind::Failed));
     }
@@ -329,7 +335,24 @@ pub async fn run(req: &Request) -> Result<Outcome, AgentError> {
     #[cfg(unix)]
     cmd.process_group(0);
 
-    let started = Instant::now();
+    let config = crate::config::Config::load()
+        .map_err(|e| AgentError(format!("cannot load concurrency config: {e:#}"), ErrorKind::Failed))?;
+    let limit = config.concurrency.limit(req.agent);
+    let slots = crate::paths::slots_dir();
+    if limit != 0 {
+        crate::paths::ensure_dir(&slots)
+            .map_err(|e| AgentError(format!("cannot create slots dir: {e}"), ErrorKind::Failed))?;
+    }
+    let waiting = Instant::now();
+    let _slot = crate::slots::acquire(&slots, req.agent, limit, started, req.timeout).await?;
+    let slot_wait_secs = waiting.elapsed().as_secs_f64();
+    let remaining = req.timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(AgentError(
+            format!("{} timed out waiting for a concurrency slot ({slot_wait_secs:.2}s); no CLI was started, no tokens spent", req.agent.name()),
+            ErrorKind::Timeout,
+        ));
+    }
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             AgentError(
@@ -351,11 +374,11 @@ pub async fn run(req: &Request) -> Result<Outcome, AgentError> {
 
     // Wait for the process, not for its pipes: a background child the agent
     // started (dev server, watcher) may hold them open forever.
-    let status = match tokio::time::timeout(req.timeout, child.wait()).await {
+    let status = match tokio::time::timeout(remaining, child.wait()).await {
         Ok(r) => r.map_err(|e| AgentError(format!("{} failed: {e}", plan.program), ErrorKind::Failed))?,
         Err(_) => {
             return Err(AgentError(
-                format!("{} timed out after {}s and was killed", req.agent.name(), req.timeout.as_secs()),
+                format!("{} timed out after {}s (waited {slot_wait_secs:.2}s for a concurrency slot) and was killed", req.agent.name(), req.timeout.as_secs()),
                 ErrorKind::Timeout,
             ))
         }
@@ -377,6 +400,7 @@ pub async fn run(req: &Request) -> Result<Outcome, AgentError> {
             text,
             exit_code: code,
             duration_secs,
+            slot_wait_secs,
         }),
         Ok(text) if !text.trim().is_empty() => Err(AgentError(
             format!(
@@ -538,6 +562,11 @@ mod tests {
         assert!(!w.args.contains(&"--skip-git-repo-check".to_string()));
         assert!(p.args.contains(&"--skip-git-repo-check".to_string()));
         assert_eq!(w.output, Output::File(PathBuf::from("/s/last-message.txt")));
+        for args in [&p.args, &w.args] {
+            for value in ["features.multi_agent=false", "features.memories=false"] {
+                assert!(args.windows(2).any(|pair| pair[0] == "-c" && pair[1] == value));
+            }
+        }
     }
 
     #[test]
@@ -616,7 +645,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn background_child_does_not_block_completion() {
         let _lock = crate::paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (_d, bin) = fake("sleep 30 &\necho '{\"text\":\"PONG\"}'\nexit 0");
+        let (home, bin) = fake("sleep 30 &\necho '{\"text\":\"PONG\"}'\nexit 0");
+        let _home = crate::paths::EnvVar::set("BATON_HOME", home.path());
         let _bin = crate::paths::EnvVar::set("BATON_GROK_BIN", &bin);
         let mut r = req(Agent::Grok, Mode::ReadOnly, None);
         r.cwd = std::env::temp_dir();
@@ -630,11 +660,50 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     #[allow(clippy::await_holding_lock)]
+    async fn slot_timeout_never_starts_cli_and_wait_uses_run_budget() {
+        let _lock = crate::paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, bin) = fake("touch started\nsleep 2\necho PONG");
+        let _home = crate::paths::EnvVar::set("BATON_HOME", home.path());
+        let _bin = crate::paths::EnvVar::set("BATON_CODEX_BIN", &bin);
+        std::fs::write(home.path().join("config.toml"), "[concurrency]\ncodex = 1\n").unwrap();
+        let slots = crate::paths::slots_dir();
+        crate::paths::ensure_dir(&slots).unwrap();
+        let held = crate::paths::lock(&slots.join("codex-0.lock")).unwrap();
+        let mut r = req(Agent::Codex, Mode::ReadOnly, None);
+        r.cwd = home.path().to_path_buf();
+        r.timeout = Duration::from_millis(100);
+        let err = run(&r).await.unwrap_err();
+        assert_eq!(err.1, ErrorKind::Timeout);
+        assert!(err.0.contains("no CLI was started"), "{}", err.0);
+        assert!(!home.path().join("started").exists());
+
+        r.timeout = Duration::from_secs(3);
+        let started = Instant::now();
+        let waiting = run(&r);
+        tokio::pin!(waiting);
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut waiting).await.is_err());
+        drop(held);
+        let err = waiting.await.unwrap_err();
+        assert_eq!(err.1, ErrorKind::Timeout);
+        assert!(err.0.contains("and was killed"), "{}", err.0);
+        assert!(home.path().join("started").exists());
+        assert!(started.elapsed() < Duration::from_secs(4));
+        // A killed CLI releases its slot; the next run succeeds.
+        std::fs::write(&bin, "#!/bin/sh\necho PONG\n").unwrap();
+        let outcome = run(&r).await.unwrap();
+        assert_eq!(outcome.text.trim(), "PONG");
+        assert!(outcome.slot_wait_secs < 1.0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
     async fn usage_limit_stderr_is_quota() {
         let _lock = crate::paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let script = r#"printf '%s\n' 'ERROR: You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at Nov 4th, 2026 2:38 PM.' >&2
 exit 1"#;
-        let (_d, bin) = fake(script);
+        let (home, bin) = fake(script);
+        let _home = crate::paths::EnvVar::set("BATON_HOME", home.path());
         let _bin = crate::paths::EnvVar::set("BATON_CODEX_BIN", &bin);
         let mut r = req(Agent::Codex, Mode::ReadOnly, None);
         r.cwd = std::env::temp_dir();
@@ -648,7 +717,8 @@ exit 1"#;
     #[allow(clippy::await_holding_lock)]
     async fn generic_stderr_is_failed_even_if_the_reply_mentions_limits() {
         let _lock = crate::paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (_d, bin) = fake("echo boom >&2\nexit 1");
+        let (home, bin) = fake("echo boom >&2\nexit 1");
+        let _home = crate::paths::EnvVar::set("BATON_HOME", home.path());
         let _bin = crate::paths::EnvVar::set("BATON_CODEX_BIN", &bin);
         let mut r = req(Agent::Codex, Mode::ReadOnly, None);
         r.cwd = std::env::temp_dir();
@@ -670,7 +740,8 @@ if [ -n "$out" ]; then
 fi
 printf '%s\n' boom >&2
 exit 1"#;
-        let (_d, bin) = fake(script);
+        let (home, bin) = fake(script);
+        let _home = crate::paths::EnvVar::set("BATON_HOME", home.path());
         let _bin = crate::paths::EnvVar::set("BATON_CODEX_BIN", &bin);
         let err = run(&r).await.unwrap_err();
         assert_eq!(err.1, ErrorKind::Failed);
@@ -682,7 +753,8 @@ exit 1"#;
 for i in 1 2 3 4 5 6; do printf 'line %s\n' "$i" >&2; done
 printf '%s\n' 'ERROR: sandbox denied' >&2
 exit 1"#;
-        let (_d, bin) = fake(script);
+        let (home, bin) = fake(script);
+        let _home = crate::paths::EnvVar::set("BATON_HOME", home.path());
         let _bin = crate::paths::EnvVar::set("BATON_CODEX_BIN", &bin);
         assert_eq!(run(&r).await.unwrap_err().1, ErrorKind::Failed);
     }

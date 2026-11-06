@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### Added
+- 並行上限：`[concurrency]` 設定 `codex`、`grok` 同時執行的 CLI 數量，預設各 4，`0` 不限。上限跨所有 baton 程序共用（`~/.baton/slots/` 檔案鎖，程序結束自動釋放）；等待時間算進呼叫的 timeout，等到逾時回錯誤且不啟動 CLI。run log 狀態列多記 `slot wait`。
 - Codex 額度重置券自動兌換：`delegate`、`ask_codex` 與接手 worker 遇到可恢復的額度上限時，預設自動花一張券，無法撤回；`[rotation] auto_reset = false` 可停用。`reset_min_wait_secs` 預設 3600，距自然重置不到這麼多秒就保留券。跨程序鎖與固定冪等鍵防止重複兌換，每個工作跨步驟與重試最多兌換一張券。嘗試會在送出前寫一行 `pending`，結束後再寫一行最終結果到 `~/.baton/resets.jsonl`，兩行共用券 ID 與冪等鍵；只有 `pending` 而沒有最終結果表示結果未知。取消呼叫後，已啟動的兌換仍會完成並記錄結果。`baton quota` 與 `quota_status` 永遠只查詢、不花券；額度輸出會列出可用張數。呼叫中恢復額度後，`delegate` 與接手 worker 僅在工作樹未改動時重試同一步一次，`ask_codex` 則提示重新呼叫。
 - 額度探針：`baton quota [--refresh]` 與 MCP 工具 `quota_status`。Codex 透過 `codex app-server` 的 `account/rateLimits/read` 即時查詢（不耗額度，同一個 MCP server 內的並行呼叫共用一次探測），Grok 沒有額度 API，只在呼叫因額度失敗後標為用完。狀態存於 `~/.baton/quota.json`。
 - 自動輪替：MCP 工具 `delegate` 依 `[rotation] order`（預設 codex → grok）跳過額度用完的廠商，呼叫中撞額度就換下一家；全部用完時回 `DELEGATES_EXHAUSTED`，由 Claude 自己做。模型與推理深度依 `kind`（code／security／research）與 `difficulty`（easy／normal／hard）決定。`write` 模式下 agent 已改檔才撞額度時不換人。額度錯誤只從 CLI stderr 的最後 5 行判斷，避免 agent 讀到的檔案內容造成誤判；`refresh` 會清掉 Grok 的額度錯誤紀錄。
@@ -20,6 +21,7 @@
 - `baton install [--apply]`：註冊 hooks（先備份 settings.json，換位置時就地更新）與 MCP server，並合併 MCP 設定到各帳號。
 
 ### Changed
+- baton 啟動的 `codex exec` 一律加上 `-c features.multi_agent=false -c features.memories=false`，不讓 Codex 在派工中自開子代理、不載入 memories（實測子代理約占派工 token 的 37%）。需要 Codex 子代理的工作請直接用 Codex。
 - 接手的背景 worker 會照 `[rotation] order` 輪替：原定 agent 額度用完時換下一家，換過人會記在 handoff 備註與報告開頭；已改檔才撞額度則不換。
 - `ask_codex`／`ask_grok` 在該家額度用完且無法用重置券恢復時回錯誤，呼叫中撞額度會記錄；Codex 兌換後提示重新呼叫，其他情況提示改用 `delegate`。
 

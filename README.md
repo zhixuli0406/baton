@@ -157,6 +157,14 @@ baton handoff start           # 手動把這個目錄最近的 Claude 對話交�
 
 同樣四個動作也有 MCP 工具版，Claude 在對話裡就能用：`handoff_list`、`handoff_show <id>` 只讀；`handoff_stop <id>` 會終止接手並解除改檔封鎖，`handoff_start`（參數 `agent`、`mode`、`cwd` 皆選填，預設取設定檔）會在背景把目前 repo 最近的對話交出去。工具說明已寫明後兩者只在使用者要求時使用；`handoff_show` 回傳的報告一律框在 `<handoff_report>` 內標示為資料，而且不會把它記成「已送達」，撞額度的那個 session 仍會照常收到一次。
 
+### 用量控制：Codex 子代理、memories 與並行上限
+
+baton 啟動的每個 `codex exec`（`ask_codex`、`delegate`、接手 worker）都會加上 `-c features.multi_agent=false -c features.memories=false`。實測 2026-10-28～11-07 的 baton 派工中，Codex 自己再開的子代理（code-reviewer、worker、security-reviewer）約占總 token 的 37%，memories 每次會多帶約 34k 字元；派工時審查由 Claude 負責，所以關掉。直接開 Codex（桌面版、`codex` TUI）不受影響。
+
+同時執行的 CLI 數量有上限，由 `[concurrency]` 設定，預設 Codex 與 Grok 各 4 個，`0` 表示不限。上限跨所有 baton 程序共用（每個 Claude Code session 各有一個 MCP server），靠 `~/.baton/slots/` 下的檔案鎖計數；程序結束或當掉時鎖會自動釋放。沒有空位時每 2 秒重試一次，等待時間算進該次呼叫的 `timeout_secs`，等到逾時就回錯誤，訊息會寫明 CLI 沒有啟動、沒有耗用 token。等了多久記在 run log 的狀態列（`slot wait`）。額度探針不佔位。
+
+### 設定檔
+
 設定檔在 `~/.baton/config.toml`，內容與預設值：
 
 ```toml
@@ -177,6 +185,10 @@ probe_ttl_secs = 300   # Codex 探針結果沿用多久
 cooldown_secs = 3600   # 不知道重置時間時（Grok，或探針失敗），撞額度後封鎖多久
 auto_reset = true      # Codex 用完時自動花重置券，無法撤回；false 停用
 reset_min_wait_secs = 3600 # 距自然重置不到這麼多秒時保留券
+
+[concurrency]          # 同時執行的 CLI 上限，跨所有 baton 程序；0 表示不限
+codex = 4
+grok = 4
 
 [models]               # 選填：各 agent 的預設模型（沒給 model 也沒給 capability 時用）
 # codex = "gpt-6.1-sol"
@@ -212,7 +224,7 @@ user scope 的 MCP server 設定存在各帳號的 `.claude.json` 裡。`account
 
 ### 資料存放
 
-`~/.baton` 權限 0700，裡面的檔案 0600。內容包括呼叫紀錄（`runs/`）、交接單與報告（`handoffs/`）、各家額度狀態（`quota.json`）、重置券兌換嘗試（`resets.jsonl`，含時間、券 ID、冪等鍵，每次嘗試各有一行 `pending` 與最終結果；只有 `pending` 表示結果未知）、hook 事件紀錄（`events.jsonl`，用來比對實際撞額度時 Claude Code 送出的訊息）。
+`~/.baton` 權限 0700，裡面的檔案 0600。內容包括呼叫紀錄（`runs/`）、交接單與報告（`handoffs/`）、各家額度狀態（`quota.json`）、重置券兌換嘗試（`resets.jsonl`，含時間、券 ID、冪等鍵，每次嘗試各有一行 `pending` 與最終結果；只有 `pending` 表示結果未知）、hook 事件紀錄（`events.jsonl`，用來比對實際撞額度時 Claude Code 送出的訊息）、並行上限的鎖檔（`slots/`）。
 
 ## 開發
 

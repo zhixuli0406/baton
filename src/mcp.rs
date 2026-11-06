@@ -774,7 +774,7 @@ fn write_run_log(req: &Request, result: &Result<agents::Outcome, agents::AgentEr
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let (status, body) = match result {
-        Ok(o) => (format!("ok ({:.1}s, exit {:?})", o.duration_secs, o.exit_code), o.text.as_str()),
+        Ok(o) => (format!("ok ({:.1}s, exit {:?}, slot wait {:.2}s)", o.duration_secs, o.exit_code, o.slot_wait_secs), o.text.as_str()),
         Err(e) => ("error".to_string(), e.0.as_str()),
     };
     let text = format!(

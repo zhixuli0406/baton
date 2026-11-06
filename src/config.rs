@@ -21,6 +21,30 @@ pub struct Config {
     /// Extra or replacement rows for the model catalog (`[[catalog]]`).
     pub catalog: Vec<catalog::Entry>,
     pub rotation: RotationConfig,
+    pub concurrency: ConcurrencyConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConcurrencyConfig {
+    /// Maximum concurrent CLI runs per agent across baton processes; zero is unlimited.
+    pub codex: usize,
+    pub grok: usize,
+}
+
+impl Default for ConcurrencyConfig {
+    fn default() -> Self {
+        Self { codex: 4, grok: 4 }
+    }
+}
+
+impl ConcurrencyConfig {
+    pub fn limit(&self, agent: Agent) -> usize {
+        match agent {
+            Agent::Codex => self.codex,
+            Agent::Grok => self.grok,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -153,6 +177,22 @@ mod tests {
         assert!(Config::parse("[handoff]\nagent = \"gpt\"\n").is_err());
         assert!(Config::parse("[handoff]\nagent = \"gemini\"\n").is_err());
         assert!(Config::parse("[[catalog]]\nagent = \"codex\"\nmodel = \"x\"\ntag = [\"fast\"]\n").is_err());
+    }
+
+    #[test]
+    fn concurrency_defaults_and_overrides() {
+        let c = Config::parse("").unwrap();
+        assert_eq!(c.concurrency.limit(Agent::Codex), 4);
+        assert_eq!(c.concurrency.limit(Agent::Grok), 4);
+        let c = Config::parse("[concurrency]\ncodex = 2\ngrok = 7\n").unwrap();
+        assert_eq!(c.concurrency.codex, 2);
+        assert_eq!(c.concurrency.grok, 7);
+        let c = Config::parse("[concurrency]\ncodex = 0\n").unwrap();
+        assert_eq!(c.concurrency.codex, 0);
+        assert_eq!(c.concurrency.grok, 4);
+        assert_eq!(Config::parse("[concurrency]\ngrok = 0\n").unwrap().concurrency.grok, 0);
+        assert!(Config::parse("[concurrency]\ncodxe = 1\n").is_err());
+        assert!(Config::parse("[concurrency]\ncodex = -1\n").is_err());
     }
 
     #[test]

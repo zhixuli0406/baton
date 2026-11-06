@@ -32,6 +32,10 @@ pub fn runs_dir() -> PathBuf {
     baton_home().join("runs")
 }
 
+pub fn slots_dir() -> PathBuf {
+    baton_home().join("slots")
+}
+
 pub fn config_file() -> PathBuf {
     baton_home().join("config.toml")
 }

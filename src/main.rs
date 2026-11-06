@@ -10,6 +10,7 @@ mod mcp_handoff;
 mod paths;
 mod quota;
 mod routing;
+mod slots;
 mod transcript;
 
 use std::io::Read;
