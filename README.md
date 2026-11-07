@@ -244,7 +244,7 @@ user scope 的 MCP server 設定存在各帳號的 `.claude.json` 裡。`account
 
 - 不要用 `/logout` 換帳號，它會撤銷 refresh token。
 - 換帳號後 prompt cache 會失效，接續長對話的第一則訊息會比較耗額度。
-- Anthropic 的條款把訂閱方案的用量上限定位為「一般個人使用」，[新版 AUP](https://www.anthropic.com/legal/aup)（2026-11-12 生效）禁止用多個帳號規避限制。baton 刻意不在 Claude 帳號之間自動輪替，帳號要怎麼用由你自己判斷。
+- 條款（2026-11-07 查證原文）：[AUP](https://www.anthropic.com/legal/aup)（2026-11-12 生效版）的「Do Not Abuse Our Platform」一節禁止「Coordinate malicious activity across multiple accounts, or create multiple accounts, to avoid detection, circumvent product guardrails, or generate identical or similar inputs that otherwise violate our Usage Policy」。這條針對的是為了逃避偵測、繞過防護，或重送違規內容而使用多個帳號，AUP 和 [Consumer Terms](https://www.anthropic.com/legal/consumer-terms) 都沒有直接提到用量上限。有解讀空間的是同一節的「Intentionally bypass or interfere with capabilities, restrictions, or guardrails established within our products」：用量上限算不算這裡的 restrictions，條文沒有寫明。Consumer Terms 也允許 Anthropic 在認定違約時不經通知停權。baton 不會自動換掉你正在對話的帳號；要不要把第二個帳號設成 worker，由你自己判斷，有疑問可寫信到 support@anthropic.com 確認。
 
 ### 資料存放
 

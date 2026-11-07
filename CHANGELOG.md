@@ -26,6 +26,9 @@
 - 接手的背景 worker 會照 `[rotation] order` 輪替：原定 agent 額度用完時換下一家，換過人會記在 handoff 備註與報告開頭；已改檔才撞額度則不換。
 - `ask_codex`／`ask_grok` 在該家額度用完且無法用重置券恢復時回錯誤，呼叫中撞額度會記錄；Codex 兌換後提示重新呼叫，其他情況提示改用 `delegate`。
 
+### Fixed
+- README 原本寫新版 AUP「禁止用多個帳號規避限制」，原文並沒有這句。現在改為引用 AUP 原文，並標出用量上限是否算「restrictions」這個仍有解讀空間的地方（2026-11-07 查證）。
+
 ### Removed
 - `ask_gemini`（Google Antigravity CLI `agy`）：Google 官方 FAQ 明寫 consumer 方案下包進第三方 coding agent 不受支援、條款第 6 條視為違約，且停權連帶封鎖 Gemini CLI 與 Code Assist（2026-10-27）。`BATON_GEMINI_BIN` 一併移除；`[handoff] agent = "gemini"` 現在會被設定檔拒絕。
 
