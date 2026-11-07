@@ -163,7 +163,7 @@ fn dispatch(msg: &Value) -> Dispatch {
                     "protocolVersion": version,
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "baton", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "Delegate work to other vendors' coding agents (Codex, Grok). They cannot see this conversation: give each call a self-contained task. Choose the agent and model by capability: each ask_* description lists that vendor's models with tags; pass `capability` (e.g. security, frontier, fast, web_search) to let baton pick, or `model` to pin one; `list_models` prints the full table. Defensive security work (vulnerability review, hardening, threat modelling) should go to ask_codex with capability=security. Default to mode=read_only; use write only when the agent should edit files. The handoff_* tools inspect or steer a handoff (another agent continuing the task after Claude hit its usage limit): handoff_list and handoff_show are read-only; handoff_stop and handoff_start change state, so use them only when the user asks. For implementation work prefer `delegate`: it rotates codex → grok by quota and picks model/effort from kind and difficulty; if it returns DELEGATES_EXHAUSTED, do the work yourself. `delegate`, ask_* and handoffs may automatically and irreversibly spend a Codex reset credit before skipping it; set rotation.auto_reset=false to disable. `quota_status` shows remaining quota and never spends reset credits.",
+                    "instructions": "Delegate work to other vendors' coding agents (Codex, Grok). They cannot see this conversation: give each call a self-contained task. Choose the agent and model by capability: each ask_* description lists that vendor's models with tags; pass `capability` (e.g. security, frontier, fast, web_search) to let baton pick, or `model` to pin one; `list_models` prints the full table. Defensive security work (vulnerability review, hardening, threat modelling) should go to ask_codex with capability=security. Default to mode=read_only; use write only when the agent should edit files. The handoff_* tools inspect or steer a handoff (another agent continuing the task after Claude hit its usage limit): handoff_list and handoff_show are read-only; handoff_stop and handoff_start change state, so use them only when the user asks. For implementation work prefer `delegate`: it follows the configured rotation order (default codex → grok, optionally claude) by quota and picks model/effort from kind and difficulty; if it returns DELEGATES_EXHAUSTED, do the work yourself. `delegate`, ask_* and handoffs may automatically and irreversibly spend a Codex reset credit before skipping it; set rotation.auto_reset=false to disable. `quota_status` shows remaining quota and never spends reset credits.",
                 }
             }))
         }
@@ -171,8 +171,9 @@ fn dispatch(msg: &Value) -> Dispatch {
         "tools/list" => {
             // A broken config is reported by the call itself; the list
             // falls back to the built-in catalog so tools still appear.
-            let catalog = Config::load().map(|c| c.catalog()).unwrap_or_else(|_| Catalog::with_overrides(&[]));
-            Dispatch::Reply(json!({"jsonrpc": "2.0", "id": id, "result": {"tools": tool_list(&catalog)}}))
+            let config = Config::load().unwrap_or_default();
+            let catalog = config.catalog();
+            Dispatch::Reply(json!({"jsonrpc": "2.0", "id": id, "result": {"tools": tool_list(&catalog, &config.claude.account)}}))
         }
         "tools/call" => Dispatch::Call { id, params },
         _ => Dispatch::Reply(error_response(id, -32601, &format!("method not found: {method}"))),
@@ -187,23 +188,26 @@ fn tool_name(agent: Agent) -> String {
     format!("ask_{}", agent.name())
 }
 
-fn tool_description(agent: Agent, catalog: &Catalog) -> String {
+fn tool_description(agent: Agent, catalog: &Catalog, account: &str) -> String {
+    let claude_intro = format!("Run Claude Code under the user's second Claude subscription account ({account}). No shell commands; edits only in write mode. Blocks until the agent finishes; returns its final report.");
     let intro = match agent {
+        Agent::Claude => &claude_intro,
         Agent::Codex => "Run OpenAI Codex (Codex CLI, user's ChatGPT login) as a coding agent in a working directory. Good for an independent second opinion or code review from a different model family, careful implementation of a well-specified change, debugging, and (with capability=security) defensive security review. Blocks until the agent finishes; returns its final report.",
         Agent::Grok => "Run xAI Grok (Grok Build CLI, user's grok.com login) as a coding agent in a working directory. Has web search, so it suits questions about recent releases, current docs and news, plus a contrasting opinion from another model family. Blocks until the agent finishes; returns its final report.",
     };
     format!("{intro}\n\nModels [capability tags]:\n{}", catalog.summary(agent))
 }
 
-fn tool_list(catalog: &Catalog) -> Vec<Value> {
+fn tool_list(catalog: &Catalog, account: &str) -> Vec<Value> {
     let tags: Vec<&str> = catalog::TAGS.iter().map(|(t, _)| *t).collect();
     let efforts: Vec<&str> = Effort::ALL.iter().map(|e| e.name()).collect();
     let mut tools: Vec<Value> = Agent::ALL
         .into_iter()
+        .filter(|a| *a != Agent::Claude || !account.is_empty())
         .map(|a| {
             json!({
                 "name": tool_name(a),
-                "description": tool_description(a, catalog),
+                "description": tool_description(a, catalog, account),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -239,7 +243,7 @@ const CWD_DESC: &str = "Absolute working directory. Defaults to the directory Cl
 fn delegate_tool(efforts: &[&str]) -> Value {
     json!({
         "name": "delegate",
-        "description": "Preferred way to hand work to another vendor's coding agent with automatic rotation. baton tries agents in the configured order (default codex, then grok), skips any whose usage quota is exhausted (Codex: live probe; Grok: recorded quota errors) and falls through to the next one if a call fails on quota. Before skipping Codex it may automatically and irreversibly spend a reset credit (disable with rotation.auto_reset=false); after a quota failure it retries the same step once only if files are untouched. Model and reasoning effort come from `kind` and `difficulty`, so easy work does not burn the most expensive model. If every agent is out of quota the result starts with DELEGATES_EXHAUSTED: then do the task yourself. Use ask_codex / ask_grok only to pin a specific vendor or model.",
+        "description": "Preferred way to hand work to another vendor's coding agent with automatic rotation. baton tries agents in the configurable order (default codex, then grok; may include claude using a second subscription account), skips any whose usage quota is exhausted (Codex: live probe; Grok: recorded quota errors; Claude: cached subscription windows) and falls through to the next one if a call fails on quota. Before skipping Codex it may automatically and irreversibly spend a reset credit (disable with rotation.auto_reset=false); after a quota failure it retries the same step once only if files are untouched. Claude may be tried first for task types listed in `[claude] prefer`. Model and reasoning effort come from `kind` and `difficulty`, so easy work does not burn the most expensive model. If every agent is out of quota the result starts with DELEGATES_EXHAUSTED: then do the task yourself. Use ask_codex / ask_grok / ask_claude only to pin a specific vendor or model.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -260,7 +264,7 @@ fn delegate_tool(efforts: &[&str]) -> Value {
 fn quota_status_tool() -> Value {
     json!({
         "name": "quota_status",
-        "description": "Show each delegate agent's usage quota (Codex via a live probe that spends no quota, Grok from recorded quota errors) and the rotation order `delegate` will use. Read-only. Pass refresh=true to force a new Codex probe.",
+        "description": "Show each delegate agent's usage quota (Codex via a live probe that spends no quota, Grok from recorded quota errors, Claude from cached subscription windows) and the rotation order `delegate` will use. Read-only. Pass refresh=true to force a new Codex probe.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -513,7 +517,7 @@ async fn call_tool(params: &Value, default_cwd: &std::path::Path) -> Result<Valu
     let catalog = config.catalog();
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     if name == LIST_MODELS_TOOL {
-        return Ok(tool_text(&catalog.render(), false));
+        return Ok(tool_text(&catalog.render_enabled(!config.claude.account.is_empty()), false));
     }
     let empty = json!({});
     let arguments = params.get("arguments").unwrap_or(&empty);
@@ -610,6 +614,22 @@ enum StepOutcome {
     Retry,
 }
 
+fn delegate_steps(parsed: &DelegateArgs, config: &Config) -> Vec<routing::Step> {
+    let order = if config.rotation.enabled {
+        config.rotation.order.clone()
+    } else {
+        vec![config.rotation.order[0]]
+    };
+    let catalog = config.catalog();
+    let steps = routing::plan(parsed.kind, parsed.difficulty, parsed.effort, &catalog, &order);
+    let key = format!("{}.{}", parsed.kind.name(), parsed.difficulty.name());
+    if !config.claude.account.is_empty() && config.claude.prefer.contains(&key) {
+        routing::prefer_first(steps, Agent::Claude)
+    } else {
+        steps
+    }
+}
+
 async fn call_delegate(args: &Value, default_cwd: &Path, config: &Config) -> Value {
     let parsed = match parse_delegate_args(args, default_cwd, &config.write.allowed_roots) {
         Ok(a) => a,
@@ -620,13 +640,7 @@ async fn call_delegate(args: &Value, default_cwd: &Path, config: &Config) -> Val
             return tool_text(&hooks::active_message(&active), true);
         }
     }
-    let order = if config.rotation.enabled {
-        config.rotation.order.clone()
-    } else {
-        vec![config.rotation.order[0]]
-    };
-    let catalog = config.catalog();
-    let steps = routing::plan(parsed.kind, parsed.difficulty, parsed.effort, &catalog, &order);
+    let steps = delegate_steps(&parsed, config);
     let mut skipped = Vec::new();
     let mut notes = Vec::new();
     let mut may_redeem = true;
@@ -827,6 +841,23 @@ mod tests {
     }
 
     #[test]
+    fn claude_tool_and_models_are_exposed_only_when_enabled() {
+        let catalog = cat();
+        let disabled = tool_list(&catalog, "");
+        let enabled = tool_list(&catalog, "work");
+        assert!(!disabled.iter().any(|t| t["name"] == "ask_claude"));
+        assert_eq!(enabled.len(), disabled.len() + 1);
+        assert_eq!(enabled[2]["name"], "ask_claude");
+        let description = enabled[2]["description"].as_str().unwrap();
+        assert!(description.contains("second Claude subscription account (work)"));
+        assert!(description.contains("No shell commands"));
+        assert!(description.contains("edits only in write mode"));
+        assert_eq!(enabled.iter().filter(|t| t["name"] != "ask_claude").collect::<Vec<_>>(), disabled.iter().collect::<Vec<_>>());
+        assert!(!catalog.render_enabled(false).contains("claude"));
+        assert!(catalog.render_enabled(true).contains("claude-sonnet-5-5"));
+    }
+
+    #[test]
     fn jev_run_record_joins_jsonl_without_secret() {
         let _guard = paths::TEST_ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -869,9 +900,7 @@ mod tests {
 
     #[test]
     fn lists_tools_with_catalog() {
-        let m = json!({"jsonrpc":"2.0","id":2,"method":"tools/list"});
-        let Dispatch::Reply(r) = dispatch(&m) else { panic!() };
-        let tools = r["result"]["tools"].as_array().unwrap();
+        let tools = tool_list(&cat(), "");
         let names: Vec<_> = tools.iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
         assert_eq!(names[..5], ["ask_codex", "ask_grok", "delegate", "quota_status", LIST_MODELS_TOOL]);
         assert_eq!(names[5..], mcp_handoff::TOOLS);
@@ -884,7 +913,7 @@ mod tests {
         assert!(codex["description"].as_str().unwrap().contains("gpt-daybreak-blue-latest"));
         assert!(codex["inputSchema"]["properties"]["capability"]["enum"].as_array().unwrap().iter().any(|v| v == "security"));
         assert_eq!(codex["inputSchema"]["properties"]["effort"]["enum"].as_array().unwrap().len(), 5);
-        assert!(!r.to_string().contains("gemini"));
+        assert!(!serde_json::to_string(&tools).unwrap().contains("gemini"));
     }
 
     #[test]
@@ -1174,6 +1203,64 @@ mod tests {
         assert!(parse(&p).unwrap().is_err());
         let p = json!({"name":"ask_grok","arguments":{"task":"x".repeat(MAX_TASK_CHARS + 1)}});
         assert!(parse(&p).unwrap().is_err());
+    }
+
+    #[test]
+    fn delegate_default_claude_preference_matches_task_table() {
+        let config = Config::parse(r#"
+[claude]
+account = "claude-ultra-2"
+[rotation]
+order = ["codex", "claude", "grok"]
+"#).unwrap();
+        for (kind, difficulty, expected) in [
+            ("code", "hard", vec![
+                (Agent::Claude, "claude-opus-5-5", Effort::High, false),
+                (Agent::Codex, "gpt-6-astra", Effort::High, false),
+                (Agent::Grok, "grok-4.7", Effort::High, false),
+            ]),
+            ("code", "normal", vec![
+                (Agent::Codex, "gpt-6.1-sol", Effort::Medium, false),
+                (Agent::Claude, "claude-sonnet-5-5", Effort::Medium, false),
+                (Agent::Grok, "grok-4.7", Effort::Medium, false),
+            ]),
+            ("security", "normal", vec![
+                (Agent::Codex, "gpt-daybreak-blue-latest", Effort::High, false),
+                (Agent::Claude, "claude-opus-5-5", Effort::High, true),
+                (Agent::Grok, "grok-4.7", Effort::High, true),
+            ]),
+            ("research", "normal", vec![
+                (Agent::Grok, "grok-4.7", Effort::Medium, false),
+                (Agent::Codex, "gpt-6.1-sol", Effort::Medium, true),
+                (Agent::Claude, "claude-sonnet-5-5", Effort::Medium, true),
+            ]),
+        ] {
+            let parsed = parse_delegate_args(&json!({"task":"x", "kind":kind, "difficulty":difficulty}), &dir(), &[]).unwrap();
+            let steps = delegate_steps(&parsed, &config);
+            let actual: Vec<_> = steps.iter().map(|s| (s.agent, s.model.as_deref().unwrap(), s.effort, s.fallback)).collect();
+            assert_eq!(actual, expected, "{kind}.{difficulty}");
+        }
+    }
+
+    #[test]
+    fn delegate_preference_requires_account_and_respects_configuration() {
+        let mut config = Config::parse("[rotation]\norder = [\"codex\", \"claude\", \"grok\"]\n").unwrap();
+        let parsed = parse_delegate_args(&json!({"task":"x", "difficulty":"hard"}), &dir(), &[]).unwrap();
+        assert_eq!(delegate_steps(&parsed, &config)[0].agent, Agent::Codex);
+        config.claude.account = "work".into();
+        assert_eq!(delegate_steps(&parsed, &config)[0].agent, Agent::Claude);
+        config.claude.prefer.clear();
+        assert_eq!(delegate_steps(&parsed, &config)[0].agent, Agent::Codex);
+        config.claude.prefer.push("code.normal".into());
+        assert_eq!(delegate_steps(&parsed, &config)[0].agent, Agent::Codex);
+        let normal = parse_delegate_args(&json!({"task":"x"}), &dir(), &[]).unwrap();
+        assert_eq!(delegate_steps(&normal, &config)[0].agent, Agent::Claude);
+        config.rotation.order = vec![Agent::Codex, Agent::Grok];
+        assert_eq!(delegate_steps(&normal, &config)[0].agent, Agent::Codex);
+        config.rotation.order = vec![Agent::Codex, Agent::Claude, Agent::Grok];
+        config.rotation.enabled = false;
+        assert_eq!(delegate_steps(&normal, &config).len(), 1);
+        assert_eq!(delegate_steps(&normal, &config)[0].agent, Agent::Codex);
     }
 
     #[test]

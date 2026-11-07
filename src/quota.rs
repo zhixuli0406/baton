@@ -32,6 +32,7 @@ pub enum State {
 pub enum Source {
     /// A live Codex rate-limit probe.
     Probe,
+    Cache,
     /// A call that failed on quota.
     Error,
     /// Nothing known (Grok before any failure).
@@ -42,6 +43,7 @@ impl Source {
     pub fn name(self) -> &'static str {
         match self {
             Source::Probe => "probe",
+            Source::Cache => "cache",
             Source::Error => "error",
             Source::None => "none",
         }
@@ -65,6 +67,8 @@ pub struct Status {
     pub checked_at: i64,
     pub until: Option<i64>,
     pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     pub windows: Vec<Window>,
     pub detail: String,
     #[serde(default)]
@@ -197,6 +201,7 @@ fn codex_status(state: State, now: i64, until: Option<i64>, plan: Option<String>
         checked_at: now,
         until,
         plan,
+        account: None,
         windows,
         reset_credits: 0,
         reset_eligible: false,
@@ -210,7 +215,12 @@ pub fn is_blocked(s: &Status, now: i64) -> bool {
 }
 
 pub fn describe(s: &Status, now: i64) -> String {
-    let name = s.agent.name();
+    if s.agent == Agent::Claude && s.detail == "disabled ([claude] account not set)" {
+        return "claude: disabled ([claude] account not set)".into();
+    }
+    let name = if s.agent == Agent::Claude {
+        format!("claude ({})", s.account.as_deref().unwrap_or("unknown"))
+    } else { s.agent.name().to_string() };
     if s.state == State::Exhausted {
         if let Some(until) = s.until {
             if until <= now {
@@ -316,6 +326,7 @@ fn grok_unknown() -> Status {
         checked_at: unix_now(),
         until: None,
         plan: None,
+        account: None,
         windows: Vec::new(),
         reset_credits: 0,
         reset_eligible: false,
@@ -384,7 +395,8 @@ pub async fn probe_codex(timeout: Duration) -> Result<Value, String> {
 
 fn spawn_probe() -> Result<Child, String> {
     let program = Agent::Codex.program();
-    let mut cmd = Command::new(&program);
+    let resolved = paths::resolve_program(&program).map_err(|e| e.to_string())?;
+    let mut cmd = Command::new(resolved);
     cmd.arg("app-server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -481,6 +493,7 @@ fn rpc_error(v: &Value) -> Option<String> {
 pub async fn refresh(agent: Agent, cfg: &RotationConfig) -> Status {
     match agent {
         Agent::Codex => refresh_codex(cfg).await,
+        Agent::Claude => { forget(agent); claude_cached_status() },
         Agent::Grok => {
             forget(Agent::Grok);
             grok_unknown()
@@ -504,6 +517,7 @@ async fn refresh_codex(cfg: &RotationConfig) -> Status {
             checked_at: unix_now(),
             until: None,
             plan: None,
+            account: None,
             windows: Vec::new(),
             reset_credits: 0,
             reset_eligible: false,
@@ -649,7 +663,81 @@ async fn reset_session(latest: &mut Status, cfg: &RotationConfig, attempt: &mut 
     Ok(())
 }
 
+/// Evaluate local Claude usage windows; absent or expired cache never blocks work.
+fn claude_status(account: &str, info: Option<&crate::account::Info>, now: i64) -> Status {
+    let mut st = grok_unknown();
+    st.agent = Agent::Claude;
+    st.source = Source::Cache;
+    st.checked_at = now;
+    st.account = Some(account.to_string());
+    st.detail = if account.is_empty() { "disabled ([claude] account not set)".into() } else { "no usage cache".into() };
+    if let Some(info) = info {
+        for (label, minutes, window) in [("five_hour", 300, &info.five_hour), ("seven_day", 10080, &info.seven_day)] {
+            if let Some((used, reset)) = window {
+                st.windows.push(Window { label: label.into(), used_percent: *used as f64, window_minutes: Some(minutes),
+                    resets_at: chrono::DateTime::parse_from_rfc3339(reset).ok().map(|d| d.timestamp()) });
+            }
+        }
+        st.until = st.windows.iter().filter(|w| w.used_percent >= 100.0).filter_map(|w| w.resets_at).filter(|t| *t > now).max();
+        st.state = if st.until.is_some() { State::Exhausted } else if st.windows.is_empty() { State::Unknown } else { State::Available };
+        st.detail = window_detail(&st.windows);
+        if st.detail.is_empty() { st.detail = "no usage cache".into(); }
+    }
+    st
+}
+
+fn claude_cached_status() -> Status {
+    match crate::config::Config::load() {
+        Ok(config) => {
+            let name = &config.claude.account;
+            let info = if name.is_empty() { None } else { crate::account::cached_info(name).ok() };
+            claude_status(name, info.as_ref(), unix_now())
+        }
+        Err(e) => {
+            let mut st = claude_status("unknown", None, unix_now());
+            st.detail = format!("cannot load Claude config: {e}");
+            st
+        }
+    }
+}
+
+/// Parse Claude's human reset notices using the named IANA timezone.
+fn claude_reset_time(text: &str, now: i64) -> Option<i64> {
+    use chrono::{Datelike, TimeZone};
+    let notice = text.split("resets ").nth(1)?;
+    let (date_time, zone) = notice.split_once('(')?;
+    let zone: chrono_tz::Tz = zone.split(')').next()?.parse().ok()?;
+    let local_now = chrono::DateTime::from_timestamp(now, 0)?.with_timezone(&zone);
+    let (date, time) = match date_time.trim().split_once(" at ") {
+        Some((date, time)) => (Some(date), time),
+        None => (None, date_time.trim()),
+    };
+    let time = time.trim().to_ascii_lowercase();
+    let (hour, pm) = if let Some(hour) = time.strip_suffix("am") { (hour, false) }
+        else { (time.strip_suffix("pm")?, true) };
+    let hour: u32 = hour.parse().ok()?;
+    if !(1..=12).contains(&hour) { return None; }
+    let hour = hour % 12 + if pm { 12 } else { 0 };
+    let mut day = match date {
+        Some(date) => chrono::NaiveDate::parse_from_str(&format!("{} {date}", local_now.year()), "%Y %b %e").ok()?,
+        None => local_now.date_naive(),
+    };
+    let resolve = |day: chrono::NaiveDate| zone.with_ymd_and_hms(day.year(), day.month(), day.day(), hour, 0, 0).earliest().map(|d| d.timestamp());
+    let mut reset = resolve(day)?;
+    if reset <= now {
+        day = if date.is_some() { day.with_year(day.year() + 1)? } else { day.succ_opt()? };
+        reset = resolve(day)?;
+    }
+    Some(reset)
+}
+
 pub async fn check(agent: Agent, cfg: &RotationConfig) -> Status {
+    if agent == Agent::Claude {
+        let status = claude_cached_status();
+        if status.detail.starts_with("disabled") { return status; }
+        return cached(agent).filter(|s| s.account == status.account && is_blocked(s, unix_now()))
+            .filter(|s| !is_blocked(&status, unix_now()) || s.until > status.until).unwrap_or(status);
+    }
     if let Some(st) = fresh(cached(agent), cfg, unix_now()) {
         return st;
     }
@@ -709,8 +797,9 @@ pub async fn record_quota_error(agent: Agent, error_text: &str, cfg: &RotationCo
         state: State::Exhausted,
         source: Source::Error,
         checked_at: now,
-        until: Some(after(now, block)),
+        until: Some(if agent == Agent::Claude { claude_reset_time(error_text, now).unwrap_or_else(|| after(now, block)) } else { after(now, block) }),
         plan: None,
+        account: if agent == Agent::Claude { crate::config::Config::load().ok().map(|c| c.claude.account) } else { None },
         windows: Vec::new(),
         reset_credits: 0,
         reset_eligible: false,
@@ -885,6 +974,56 @@ mod tests {
 
     fn consume_params(dir: &std::path::Path) -> Vec<Value> {
         std::fs::read_to_string(dir.join("consume-params")).unwrap_or_default().lines().map(|s| serde_json::from_str(s).unwrap()).collect()
+    }
+
+    #[test]
+    fn claude_cache_blocks_only_full_future_windows() {
+        let now = 1_800_000_000;
+        let reset = chrono::DateTime::from_timestamp(now + 3600, 0).unwrap().to_rfc3339();
+        let mut info = crate::account::Info { five_hour: Some((100, reset)), ..Default::default() };
+        let st = claude_status("work", Some(&info), now);
+        assert!(is_blocked(&st, now));
+        assert_eq!(st.until, Some(now + 3600));
+        assert_eq!(st.source, Source::Cache);
+        assert!(describe(&st, now).starts_with("claude (work): exhausted until"));
+        assert!(describe(&st, now).contains("cache"));
+        assert!(!is_blocked(&claude_status("work", Some(&info), now + 3601), now + 3601));
+        info.five_hour = None;
+        info.seven_day = Some((100, chrono::DateTime::from_timestamp(now + 7200, 0).unwrap().to_rfc3339()));
+        assert_eq!(claude_status("work", Some(&info), now).until, Some(now + 7200));
+        info.seven_day = Some((100, "invalid reset".into()));
+        assert!(!is_blocked(&claude_status("work", Some(&info), now), now));
+        assert_eq!(claude_status("work", None, now).state, State::Unknown);
+        assert_eq!(describe(&claude_status("", None, now), now), "claude: disabled ([claude] account not set)");
+    }
+
+    #[test]
+    fn claude_reset_notices_use_iana_timezones_and_roll_forward() {
+        let ts = |s| chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp();
+        let now = ts("2026-10-27T12:00:00+08:00");
+        assert_eq!(claude_reset_time("You've hit your weekly limit · resets Oct 28 at 4am (Asia/Taipei)", now), Some(ts("2026-10-28T04:00:00+08:00")));
+        assert_eq!(claude_reset_time("You've hit your limit · resets 4am (Asia/Taipei)", now), Some(ts("2026-10-28T04:00:00+08:00")));
+        assert_eq!(claude_reset_time("resets 4pm (Asia/Taipei)", now), Some(ts("2026-10-27T16:00:00+08:00")));
+        assert_eq!(claude_reset_time("resets Jan 1 at 12am (UTC)", now), Some(ts("2027-01-01T00:00:00Z")));
+        assert_eq!(claude_reset_time("resets Nov 2 at 4am (America/New_York)", now), Some(ts("2026-11-02T04:00:00-05:00")));
+        for text in ["usage limit reached", "resets soon", "resets 4am (unknown)", "resets Oct 42 at 4am (UTC)"] {
+            assert_eq!(claude_reset_time(text, now), None);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn claude_quota_error_uses_reset_or_cooldown_without_probing() {
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_home, dir) = home_lock();
+        std::fs::write(dir.path().join("config.toml"), "[claude]\naccount = \"work\"\n").unwrap();
+        let cfg = RotationConfig::default();
+        let st = record_quota_error(Agent::Claude, "You've hit your limit · resets 4am (Asia/Taipei)", &cfg).await;
+        assert_eq!(st.source, Source::Error);
+        assert!(st.until.unwrap() > st.checked_at);
+        assert_eq!(check(Agent::Claude, &cfg).await, st);
+        let fallback = record_quota_error(Agent::Claude, "usage limit reached", &cfg).await;
+        assert_eq!(fallback.until, Some(fallback.checked_at + cfg.cooldown_secs as i64));
     }
 
     #[test]
@@ -1167,6 +1306,11 @@ mod tests {
     }
 
     #[test]
+    fn claude_weekly_limit_does_not_change_generic_quota_detection() {
+        assert!(!is_quota_error("You've hit your weekly limit"));
+    }
+
+    #[test]
     fn quota_phrases_match_and_ordinary_errors_do_not() {
         assert!(is_quota_error(CODEX_LIMIT));
         assert!(is_quota_error("HTTP 429 from the gateway"));
@@ -1324,6 +1468,7 @@ mod tests {
             checked_at: now,
             until: None,
             plan: None,
+            account: None,
             windows: Vec::new(),
             reset_credits: 0,
             reset_eligible: false,
@@ -1371,6 +1516,7 @@ mod tests {
             checked_at: unix_now(),
             until: None,
             plan: None,
+            account: None,
             windows: Vec::new(),
             reset_credits: 0,
             reset_eligible: false,

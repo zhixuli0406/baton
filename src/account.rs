@@ -72,8 +72,8 @@ fn state_file(dir: Option<&Path>) -> PathBuf {
     }
 }
 
-pub fn claude_command(dir: Option<&Path>) -> Command {
-    let mut cmd = Command::new(claude_bin());
+pub fn claude_command(dir: Option<&Path>) -> Result<Command> {
+    let mut cmd = Command::new(paths::resolve_program(&claude_bin())?);
     cmd.env_remove("TYPESAFE_API_KEY");
     match dir {
         Some(d) => {
@@ -83,7 +83,7 @@ pub fn claude_command(dir: Option<&Path>) -> Command {
             cmd.env_remove("CLAUDE_CONFIG_DIR");
         }
     }
-    cmd
+    Ok(cmd)
 }
 
 pub fn names() -> Vec<String> {
@@ -189,7 +189,7 @@ pub fn add(name: &str, login: bool) -> Result<PathBuf> {
     }
     sync_mcp(&dir)?;
     if login {
-        let status = claude_command(Some(&dir)).args(["auth", "login"]).status()
+        let status = claude_command(Some(&dir))?.args(["auth", "login"]).status()
             .context("cannot run `claude auth login`")?;
         if !status.success() {
             bail!("login did not complete; finish it later with `baton run {name}` and /login");
@@ -201,7 +201,7 @@ pub fn add(name: &str, login: bool) -> Result<PathBuf> {
 pub fn remove(name: &str) -> Result<()> {
     let Some(dir) = config_dir(name)? else { bail!("cannot remove the default account") };
     // Log out first so the Keychain entry for this dir is cleared.
-    let _ = claude_command(Some(&dir)).args(["auth", "logout"]).status();
+    let _ = claude_command(Some(&dir))?.args(["auth", "logout"]).status();
     // remove_dir_all removes symlinks themselves, never their targets.
     std::fs::remove_dir_all(&dir)?;
     Ok(())
@@ -219,18 +219,51 @@ pub struct Info {
 
 pub fn info(name: &str) -> Result<Info> {
     let dir = config_dir(name)?;
+    let mut cmd = claude_command(dir.as_deref())?;
+    let mut i = auth_info(name, &mut cmd);
+    let cached = cached_info(name)?;
+    i.five_hour = cached.five_hour;
+    i.seven_day = cached.seven_day;
+    Ok(i)
+}
+
+fn auth_info(name: &str, cmd: &mut Command) -> Info {
     let mut i = Info { name: name.into(), ..Default::default() };
-    if let Ok(out) = claude_command(dir.as_deref()).args(["auth", "status", "--json"]).output() {
+    if let Ok(out) = cmd.args(["auth", "status", "--json"]).output() {
         if let Ok(v) = serde_json::from_slice::<Value>(&out.stdout) {
             i.logged_in = v.get("loggedIn").and_then(Value::as_bool).unwrap_or(false);
             i.email = v.get("email").and_then(Value::as_str).map(str::to_string);
             i.plan = v.get("subscriptionType").and_then(Value::as_str).map(str::to_string);
         }
     }
+    i
+}
+
+/// Check for a locally stored Claude account identity without starting a process.
+pub fn worker_logged_in(dir: &Path) -> bool {
+    let default = paths::claude_default_dir().canonicalize().ok();
+    let state = state_file(if default.as_deref() == Some(dir) { None } else { Some(dir) });
+    read_json(&state).ok()
+        .and_then(|value| value.pointer("/oauthAccount/accountUuid").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|uuid| !uuid.is_empty())
+}
+
+/// Read identity from the canonical config directory, respecting default state placement.
+pub fn account_uuid(dir: &Path) -> Option<String> {
+    let default = paths::claude_default_dir().canonicalize().ok();
+    let state = state_file(if default.as_deref() == Some(dir) { None } else { Some(dir) });
+    read_json(&state).ok()?.pointer("/oauthAccount/accountUuid")?.as_str()
+        .filter(|uuid| !uuid.is_empty()).map(str::to_string)
+}
+
+/// Read local account state without starting Claude or accessing the network.
+pub fn cached_info(name: &str) -> Result<Info> {
+    let dir = config_dir(name)?;
     let state = read_json(&state_file(dir.as_deref())).unwrap_or_default();
+    let mut i = Info { name: name.into(), ..Default::default() };
     let window = |w: &str| {
         let u = state.pointer(&format!("/cachedUsageUtilization/utilization/{w}"))?;
-        Some((u.get("utilization")?.as_i64()?, u.get("resets_at").and_then(Value::as_str).unwrap_or("").to_string()))
+        Some((u.get("utilization")?.as_f64()? as i64, u.get("resets_at").and_then(Value::as_str).unwrap_or("").to_string()))
     };
     i.five_hour = window("five_hour");
     i.seven_day = window("seven_day");
@@ -240,7 +273,7 @@ pub fn info(name: &str) -> Result<Info> {
 /// Replace this process with `claude` running under the account.
 pub fn exec_claude(name: &str, args: &[String]) -> Result<()> {
     let dir = config_dir(name)?;
-    let mut cmd = claude_command(dir.as_deref());
+    let mut cmd = claude_command(dir.as_deref())?;
     cmd.args(args);
     #[cfg(unix)]
     {
@@ -258,6 +291,19 @@ pub fn exec_claude(name: &str, args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_logged_in_requires_a_nonempty_account_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!worker_logged_in(dir.path()));
+        let state = dir.path().join(".claude.json");
+        for json in ["{}", r#"{"oauthAccount":{}}"#, r#"{"oauthAccount":{"accountUuid":""}}"#] {
+            std::fs::write(&state, json).unwrap();
+            assert!(!worker_logged_in(dir.path()), "{json}");
+        }
+        std::fs::write(&state, r#"{"oauthAccount":{"accountUuid":"uuid-123"}}"#).unwrap();
+        assert!(worker_logged_in(dir.path()));
+    }
 
     #[test]
     fn names_are_validated() {

@@ -6,7 +6,7 @@ baton 是一支 Rust 單檔 CLI，接在原生 `claude` 旁邊。它做三件事
 
 1. **調度**：一個 MCP server，提供 `delegate`、`quota_status`、`ask_codex`、`ask_grok`、`list_models`，以及查看與操作接手的 `handoff_list`／`handoff_show`／`handoff_stop`／`handoff_start`。實作類工作交給 `delegate`：baton 先探測各家剩餘額度，依 Codex → Grok 的順序挑還有額度的那家，再依任務類型與難度決定模型和推理深度；兩家都沒額度時回報 Claude 自己做（見[自動輪替與額度探針](#自動輪替與額度探針)）。要指定廠商或模型時用 `ask_codex`／`ask_grok`，工具說明附有各家模型的能力標籤，可傳 `capability`（如 `security`、`frontier`、`fast`、`web_search`）或直接指定 `model`。
 2. **接手**：Claude 撞到訂閱額度上限時，hook 把對話整理成一份交接單，背景啟動 Codex（或你指定的 agent）接著做。Claude 回來後會自動收到接手結果。接手期間 Claude 想改檔會被擋下，兩邊不會同時改同一個 repo。
-3. **多帳號**：每個 Claude 帳號一個 `CLAUDE_CONFIG_DIR`（官方的多帳號做法），共用設定、rules、skills 和對話紀錄。`baton switch <帳號>` 一個指令換帳號並接續目前的對話。**換 Claude 帳號一律手動**，baton 不會在 Claude 帳號之間自動輪替；上面說的自動輪替只發生在 Codex 與 Grok 這兩家之間。
+3. **多帳號**：每個 Claude 帳號一個 `CLAUDE_CONFIG_DIR`（官方的多帳號做法），共用設定、rules、skills 和對話紀錄。`baton switch <帳號>` 一個指令換帳號並接續目前的對話。你正在對話的那個 Claude 帳號，baton 不會自動換掉；要換一律手動。另外可以選擇指定一個帳號當實作 worker（`ask_claude`，預設關閉），把它排進 `delegate` 的輪替順序（見 [Claude worker](#claude-worker選用預設關閉)）。
 
 ## 前置需求
 
@@ -98,6 +98,33 @@ MCP 工具 `quota_status`（參數 `refresh`，預設 false）印出同樣內容
 | `timeout_secs` | 預設 900，上限 3600 |
 
 `list_models` 不帶參數，印出完整模型表（不會啟動任何 agent）。
+
+### Claude worker（選用，預設關閉）
+
+把另一個 Claude 訂閱帳號當成實作者，用法跟 Codex、Grok 一樣。先用 `baton account add <名稱>` 建好帳號並登入，再在設定檔寫：
+
+```toml
+[claude]
+account = "work"                        # 跑 worker 的 baton 帳號名稱；留空就關閉
+
+[rotation]
+order = ["codex", "grok", "claude"]     # 要讓 delegate 用到它，得自己加進來
+```
+
+設好之後會多一個 `ask_claude` 工具，參數與 `ask_codex` 相同。`delegate` 和接手 worker 照 `order` 輪替時也會用到它；`[handoff] agent = "claude"` 可以讓它直接接手。模型表內建 `claude-opus-5-5`（`frontier`）、`claude-sonnet-5-5`（`workhorse`）、`claude-haiku-5-5`（`fast`）。
+
+baton 用 `CLAUDE_CONFIG_DIR=<該帳號目錄> claude -p` 啟動它，限制如下：
+
+- 只開放 `Read`、`Grep`、`Glob`；`write` 模式再加 `Edit`、`Write`，自動接受工作目錄內的修改。不能跑 shell 指令或抓網頁，原因和 Grok 的 `write` 模式一樣：指令沒有沙箱。build 和測試要由呼叫它的 Claude 自己跑。
+- 不載入任何 MCP server（`--strict-mcp-config`），所以它碰不到 baton，不會再往下派工。
+- hook 全部關閉（`disableAllHooks`），另外 baton 的 hook 看到 `BATON_WORKER=1` 也會直接略過，worker 撞到額度時不會觸發接手。
+- 不保存對話（`--no-session-persistence`）。各帳號共用 `projects` 目錄，存下來的話，`baton switch` 的 `--continue` 可能會接到 worker 的對話。
+- 附加一段 system prompt，要它自己寫程式碼。共用的 CLAUDE.md 裡如果有「交給 Codex 寫」之類的規則，以這段為準。
+- 環境變數裡的 `ANTHROPIC_*` 和 `CLAUDE*` 先清掉，再設定該帳號的 `CLAUDE_CONFIG_DIR`。`ANTHROPIC_API_KEY` 不會蓋掉訂閱登入。
+
+`account` 指向的帳號跟呼叫者是同一個時（例如兩邊都是 `default`），baton 視為不可用並跳過。額度判斷有兩種來源：呼叫前先讀該帳號本機快取的 5 小時／7 天用量，已滿就跳過；呼叫結果回報 `You've hit your limit` 這類錯誤時標為用完，能解析出重置時間就封鎖到那個時間，解析不出來就封鎖 `cooldown_secs`。快取是那個帳號上次互動時留下的，可能已經過時。
+
+使用前先看[多個 Claude 帳號](#多個-claude-帳號)最後一段的條款說明。
 
 #### 依能力選模型
 
@@ -202,6 +229,10 @@ reset_min_wait_secs = 3600 # 距自然重置不到這麼多秒時保留券
 [concurrency]          # 同時執行的 CLI 上限，跨所有 baton 程序；0 表示不限
 codex = 4
 grok = 4
+claude = 2
+
+[claude]               # Claude worker，見上方說明
+account = ""           # 留空表示關閉
 
 [jev]                  # Jev 派工顧問，見上方說明
 enabled = false

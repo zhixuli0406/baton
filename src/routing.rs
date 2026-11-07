@@ -19,6 +19,10 @@ pub enum Kind {
 }
 
 impl Kind {
+    pub fn name(self) -> &'static str {
+        match self { Self::Code => "code", Self::Security => "security", Self::Research => "research" }
+    }
+
     pub fn parse(s: &str) -> Option<Kind> {
         match s {
             "code" => Some(Kind::Code),
@@ -37,6 +41,10 @@ pub enum Difficulty {
 }
 
 impl Difficulty {
+    pub fn name(self) -> &'static str {
+        match self { Self::Easy => "easy", Self::Normal => "normal", Self::Hard => "hard" }
+    }
+
     pub fn parse(s: &str) -> Option<Difficulty> {
         match s {
             "easy" => Some(Difficulty::Easy),
@@ -67,6 +75,15 @@ pub fn plan(kind: Kind, difficulty: Difficulty, effort: Option<Effort>, catalog:
         .collect();
     // Stable: agents that have the primary tag stay in `order`.
     steps.sort_by_key(|s| s.fallback);
+    steps
+}
+
+/// Move one agent first while preserving every other step's relative order.
+pub fn prefer_first(mut steps: Vec<Step>, agent: Agent) -> Vec<Step> {
+    if let Some(index) = steps.iter().position(|step| step.agent == agent) {
+        let preferred = steps.remove(index);
+        steps.insert(0, preferred);
+    }
     steps
 }
 
@@ -155,6 +172,7 @@ mod tests {
             vec![
                 step(Agent::Codex, "gpt-6-luna", Effort::Low, "fast", false),
                 step(Agent::Grok, "grok-4.7-build-fast", Effort::Low, "fast", false),
+                step(Agent::Claude, "claude-haiku-5-5", Effort::Low, "fast", false),
             ]
         );
     }
@@ -167,6 +185,7 @@ mod tests {
             vec![
                 step(Agent::Codex, "gpt-6-astra", Effort::High, "frontier", false),
                 step(Agent::Grok, "grok-4.7", Effort::High, "frontier", false),
+                step(Agent::Claude, "claude-opus-5-5", Effort::High, "frontier", false),
             ]
         );
     }
@@ -179,6 +198,7 @@ mod tests {
             vec![
                 step(Agent::Codex, "gpt-daybreak-blue-latest", Effort::High, "security", false),
                 step(Agent::Grok, "grok-4.7", Effort::High, "frontier", true),
+                step(Agent::Claude, "claude-opus-5-5", Effort::High, "frontier", true),
             ]
         );
     }
@@ -191,6 +211,7 @@ mod tests {
             vec![
                 step(Agent::Grok, "grok-4.7", Effort::Medium, "web_search", false),
                 step(Agent::Codex, "gpt-6.1-sol", Effort::Medium, "workhorse", true),
+                step(Agent::Claude, "claude-sonnet-5-5", Effort::Medium, "workhorse", true),
             ]
         );
     }
@@ -201,12 +222,23 @@ mod tests {
         assert!(steps.iter().all(|s| s.effort == Effort::Max && !s.fallback));
         assert_eq!(steps[0].model.as_deref(), Some("gpt-6.1-sol"));
         assert_eq!(steps[1].model.as_deref(), Some("grok-4.7"));
+        assert_eq!(steps[2].model.as_deref(), Some("claude-sonnet-5-5"));
     }
 
     #[test]
     fn a_short_order_yields_one_step() {
         let steps = plan(Kind::Code, Difficulty::Easy, None, &cat(), &[Agent::Grok]);
         assert_eq!(steps, vec![step(Agent::Grok, "grok-4.7-build-fast", Effort::Low, "fast", false)]);
+    }
+
+    #[test]
+    fn preference_preserves_steps_and_other_agents_order() {
+        let steps = plan(Kind::Research, Difficulty::Normal, None, &cat(), &Agent::ALL);
+        assert_eq!(prefer_first(steps.clone(), Agent::Claude), [steps[2].clone(), steps[0].clone(), steps[1].clone()]);
+        assert_eq!(prefer_first(steps.clone(), Agent::Grok), steps);
+        let absent = steps[..2].to_vec();
+        assert_eq!(prefer_first(absent.clone(), Agent::Claude), absent);
+        assert!(prefer_first(Vec::new(), Agent::Claude).is_empty());
     }
 
     #[test]

@@ -243,7 +243,7 @@ mod tests {
             assert_eq!(d["inputSchema"]["additionalProperties"], false);
         }
         assert_eq!(defs[1]["inputSchema"]["required"], json!(["id"]));
-        assert_eq!(defs[3]["inputSchema"]["properties"]["agent"]["enum"], json!(["codex", "grok"]));
+        assert_eq!(defs[3]["inputSchema"]["properties"]["agent"]["enum"], json!(["codex", "grok", "claude"]));
     }
 
     #[test]

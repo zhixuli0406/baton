@@ -52,7 +52,7 @@ fn row(agent: Agent, model: &str, tags: &[&str], note: &str) -> Entry {
 
 /// Vendor-published models, in preference order within each agent.
 pub fn builtin() -> Vec<Entry> {
-    use Agent::{Codex, Grok};
+    use Agent::{Codex, Grok, Claude};
     vec![
         row(Codex, "gpt-daybreak-blue-latest", &["security"], "Daybreak Blue: latest frontier agentic coding model for broad defensive cybersecurity work"),
         row(Codex, "gpt-6-astra", &["frontier"], "GPT-6-Astra: frontier intelligence for the most demanding work (272k context)"),
@@ -66,6 +66,9 @@ pub fn builtin() -> Vec<Entry> {
         row(Grok, "grok-4.7-build-fast", &["fast", "web_search"], "grok-4.7-build-fast: faster variant of 4.7"),
         row(Grok, "grok-4.6", &["legacy", "web_search"], "grok-4.6: previous generation"),
         row(Grok, "grok-4.5", &["legacy", "web_search"], "grok-4.5: older generation"),
+        row(Claude, "claude-opus-5-5", &["frontier"], "Opus 5.5: deepest reasoning"),
+        row(Claude, "claude-sonnet-5-5", &["workhorse"], "Sonnet 5.5: everyday coding"),
+        row(Claude, "claude-haiku-5-5", &["fast"], "Haiku 5.5: fast, cheap"),
     ]
 }
 
@@ -111,12 +114,13 @@ impl Catalog {
     }
 
     /// Full table for `list_models`.
-    pub fn render(&self) -> String {
+    pub fn render_enabled(&self, claude_enabled: bool) -> String {
         let mut out = String::from("Capability tags:\n");
         for (t, d) in TAGS {
             out.push_str(&format!("  {t}: {d}\n"));
         }
         for agent in Agent::ALL {
+            if agent == Agent::Claude && !claude_enabled { continue; }
             out.push_str(&format!("\n{} (tool ask_{}):\n", agent.name(), agent.name()));
             for e in self.for_agent(agent) {
                 out.push_str(&format!("  {} [{}]\n      {}\n", e.model, e.tags.join(", "), e.note));
@@ -130,6 +134,15 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_catalog_has_only_requested_capabilities() {
+        let c = Catalog::with_overrides(&[]);
+        assert_eq!(c.for_agent(Agent::Claude).map(|e| e.model.as_str()).collect::<Vec<_>>(), ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]);
+        assert_eq!(c.tags_for(Agent::Claude), ["frontier", "workhorse", "fast"]);
+        assert!(!c.render_enabled(false).contains("claude"));
+        assert!(c.render_enabled(true).contains("claude (tool ask_claude)"));
+    }
 
     #[test]
     fn builtin_tags_are_known_and_models_valid() {
@@ -163,7 +176,7 @@ mod tests {
         assert_eq!(g47.note, "mine");
         assert_eq!(c.resolve(Agent::Grok, "security").unwrap().model, "grok-5");
         assert_eq!(c.for_agent(Agent::Grok).count(), 5);
-        assert!(c.render().contains("grok-5"));
+        assert!(c.render_enabled(true).contains("grok-5"));
         assert!(c.summary(Agent::Codex).lines().count() >= 4);
     }
 }

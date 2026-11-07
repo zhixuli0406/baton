@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### Added
+- Claude worker（`[claude] account`，預設關閉）：讓另一個 Claude 訂閱帳號以 `claude -p` 當實作者，新增 MCP 工具 `ask_claude`；把 `"claude"` 加進 `[rotation] order` 後，`delegate` 與接手 worker 也會輪到它，`[handoff] agent = "claude"` 可直接指定。只開放讀檔與（`write` 模式）改檔工具，不能跑 shell；不載入 MCP、關閉 hook、不保存對話；清掉 `ANTHROPIC_*`／`CLAUDE*` 後只設定該帳號的 `CLAUDE_CONFIG_DIR`。與呼叫者同一帳號時視為不可用。額度先讀帳號快取的 5 小時／7 天用量，再依呼叫結果的額度錯誤標記。`[concurrency] claude` 預設 2。baton 的 hook 在 `BATON_WORKER=1` 時不動作。
 - Jev 派工顧問（`[jev]`，預設關閉）：啟動 Codex 前把交辦內容（先遮罩常見憑證格式）送 TypeSafe Jev 判斷難度。`shadow` 只記錄；`enforce` 在 Jev 判為困難機率低於 0.15 時把 `hard` 降為 `normal`（`HARD-REASON:` 可覆蓋）。Daybreak 的 `xhigh`／`max` 在 `enforce` 降為 `high`；Jev 對安全重審的判斷只記錄、不套用。任何失敗照原設定執行；判斷記在 `~/.baton/jev.jsonl` 與 run log。新增依賴 `reqwest`（rustls，無預設功能、不走代理）。
 - 並行上限：`[concurrency]` 設定 `codex`、`grok` 同時執行的 CLI 數量，預設各 4，`0` 不限。上限跨所有 baton 程序共用（`~/.baton/slots/` 檔案鎖，程序結束自動釋放）；等待時間算進呼叫的 timeout，等到逾時回錯誤且不啟動 CLI。run log 狀態列多記 `slot wait`。
 - Codex 額度重置券自動兌換：`delegate`、`ask_codex` 與接手 worker 遇到可恢復的額度上限時，預設自動花一張券，無法撤回；`[rotation] auto_reset = false` 可停用。`reset_min_wait_secs` 預設 3600，距自然重置不到這麼多秒就保留券。跨程序鎖與固定冪等鍵防止重複兌換，每個工作跨步驟與重試最多兌換一張券。嘗試會在送出前寫一行 `pending`，結束後再寫一行最終結果到 `~/.baton/resets.jsonl`，兩行共用券 ID 與冪等鍵；只有 `pending` 而沒有最終結果表示結果未知。取消呼叫後，已啟動的兌換仍會完成並記錄結果。`baton quota` 與 `quota_status` 永遠只查詢、不花券；額度輸出會列出可用張數。呼叫中恢復額度後，`delegate` 與接手 worker 僅在工作樹未改動時重試同一步一次，`ask_codex` 則提示重新呼叫。

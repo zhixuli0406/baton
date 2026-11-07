@@ -17,12 +17,13 @@ pub struct Config {
     pub handoff: HandoffConfig,
     pub jev: JevConfig,
     pub write: WriteConfig,
-    /// Default model per agent name (`codex`, `grok`).
+    /// Default model per agent name (`codex`, `grok`, `claude`).
     pub models: HashMap<String, String>,
     /// Extra or replacement rows for the model catalog (`[[catalog]]`).
     pub catalog: Vec<catalog::Entry>,
     pub rotation: RotationConfig,
     pub concurrency: ConcurrencyConfig,
+    pub claude: ClaudeConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -70,15 +71,29 @@ impl Default for JevConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct ClaudeConfig {
+    pub account: String,
+    pub prefer: Vec<String>,
+}
+
+impl Default for ClaudeConfig {
+    fn default() -> Self {
+        Self { account: String::new(), prefer: vec!["code.hard".into()] }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ConcurrencyConfig {
     /// Maximum concurrent CLI runs per agent across baton processes; zero is unlimited.
     pub codex: usize,
     pub grok: usize,
+    pub claude: usize,
 }
 
 impl Default for ConcurrencyConfig {
     fn default() -> Self {
-        Self { codex: 4, grok: 4 }
+        Self { codex: 4, grok: 4, claude: 2 }
     }
 }
 
@@ -87,6 +102,7 @@ impl ConcurrencyConfig {
         match agent {
             Agent::Codex => self.codex,
             Agent::Grok => self.grok,
+            Agent::Claude => self.claude,
         }
     }
 }
@@ -159,6 +175,15 @@ impl Config {
             }
             anyhow::ensure!(root.is_absolute(), "[write] allowed_roots entries must be absolute paths or start with ~/; got {}", root.display());
         }
+        if !config.claude.account.is_empty() {
+            crate::account::validate_name(&config.claude.account)?;
+        }
+        for key in &config.claude.prefer {
+            anyhow::ensure!(key.split_once('.').is_some_and(|(kind, difficulty)|
+                crate::routing::KINDS.contains(&kind) && crate::routing::DIFFICULTIES.contains(&difficulty)),
+                "[claude] prefer entry {key:?} must be <kind>.<difficulty> (kind: {}; difficulty: {})",
+                crate::routing::KINDS.join(", "), crate::routing::DIFFICULTIES.join(", "));
+        }
         validate_rotation(&config.rotation)?;
         for value in [config.jev.difficulty_downgrade_below, config.jev.rereview_low_effort_above] {
             anyhow::ensure!(value.is_finite() && (0.0..=1.0).contains(&value), "[jev] thresholds must be probabilities");
@@ -195,6 +220,51 @@ const MAX_ROTATION_SECS: u64 = 30 * 24 * 3600;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_config_is_opt_in_and_names_are_validated() {
+        let defaults = Config::parse("").unwrap();
+        assert!(defaults.claude.account.is_empty());
+        assert_eq!(defaults.concurrency.limit(Agent::Claude), 2);
+        assert_eq!(defaults.rotation.order, [Agent::Codex, Agent::Grok]);
+        let c = Config::parse(r#"[claude]
+account = "work"
+[handoff]
+agent = "claude"
+[concurrency]
+claude = 3
+[rotation]
+order = ["codex", "grok", "claude"]
+[models]
+claude = "claude-sonnet-5-5"
+"#).unwrap();
+        assert_eq!(c.claude.account, "work");
+        assert_eq!(c.concurrency.limit(Agent::Claude), 3);
+        assert_eq!(c.handoff.agent, Agent::Claude);
+        assert_eq!(c.model_for(Agent::Claude).as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(c.rotation.order, Agent::ALL);
+        for name in ["../work", "Work", "a/b", "bad name"] {
+            assert!(Config::parse(&format!("[claude]\naccount = {name:?}\n")).is_err());
+        }
+    }
+
+    #[test]
+    fn claude_preferences_default_and_validate_task_keys() {
+        assert_eq!(Config::parse("").unwrap().claude.prefer, ["code.hard"]);
+        assert_eq!(Config::parse("[claude]\naccount = \"claude-ultra-2\"\n").unwrap().claude.prefer, ["code.hard"]);
+        for kind in crate::routing::KINDS {
+            for difficulty in crate::routing::DIFFICULTIES {
+                let key = format!("{kind}.{difficulty}");
+                let config = Config::parse(&format!("[claude]\nprefer = [{key:?}]\n")).unwrap();
+                assert_eq!(config.claude.prefer, [key]);
+            }
+        }
+        assert!(Config::parse("[claude]\nprefer = []\n").unwrap().claude.prefer.is_empty());
+        for key in ["", "code", "code.", ".hard", "review.hard", "code.extreme", "code.hard.extra", "Code.hard", " code.hard"] {
+            let error = Config::parse(&format!("[claude]\nprefer = [{key:?}]\n")).unwrap_err().to_string();
+            assert!(error.contains("[claude] prefer") && error.contains("<kind>.<difficulty>"), "{error}");
+        }
+    }
 
     #[test]
     fn jev_defaults_and_explicit_values() {
@@ -351,7 +421,7 @@ mod tests {
         let dup_later = Config::parse("[rotation]\norder = [\"codex\", \"grok\", \"codex\"]\n").unwrap_err().to_string();
         assert!(dup_later.contains("[rotation] order"), "{dup_later}");
         assert!(Config::parse("[rotation]\nnope = true\n").is_err());
-        assert!(Config::parse("[rotation]\norder = [\"claude\"]\n").is_err());
+        assert!(Config::parse("[rotation]\norder = [\"gemini\"]\n").is_err());
         let huge = Config::parse("[rotation]\ncooldown_secs = 9223372036854775807\n").unwrap_err().to_string();
         assert!(huge.contains("cooldown_secs"), "{huge}");
         assert!(Config::parse("[rotation]\nprobe_ttl_secs = 2592000\n").is_ok());

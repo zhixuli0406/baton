@@ -117,12 +117,12 @@ pub fn run(apply: bool) -> Result<()> {
         println!("hooks written");
     }
     // Re-register so a moved binary is picked up.
-    let _ = account::claude_command(None)
+    let _ = account::claude_command(None)?
         .args(["mcp", "remove", "--scope", "user", "baton"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-    let status = account::claude_command(None).args(mcp_args).status().context("cannot run claude mcp add")?;
+    let status = account::claude_command(None)?.args(mcp_args).status().context("cannot run claude mcp add")?;
     if !status.success() {
         bail!("`claude mcp add` failed; check `claude mcp list`");
     }

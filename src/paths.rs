@@ -7,6 +7,35 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// Resolve a CLI without allowing the target repository to supply the executable.
+pub fn resolve_program(name_or_path: &str) -> anyhow::Result<PathBuf> {
+    fn executable(path: &Path) -> bool {
+        let Ok(metadata) = path.metadata() else { return false };
+        if !metadata.is_file() { return false; }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        { true }
+    }
+    if name_or_path.contains('/') || Path::new(name_or_path).is_absolute() {
+        let path = Path::new(name_or_path);
+        if path.is_absolute() && executable(path) {
+            return Ok(path.canonicalize()?);
+        }
+    } else if !name_or_path.is_empty() {
+        if let Some(search) = std::env::var_os("PATH") {
+            for entry in std::env::split_paths(&search).filter(|p| p.is_absolute()) {
+                let candidate = entry.join(name_or_path);
+                if executable(&candidate) { return Ok(candidate.canonicalize()?); }
+            }
+        }
+    }
+    anyhow::bail!("cannot find {name_or_path}")
+}
+
 pub fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -156,6 +185,7 @@ pub fn mode_of(path: &Path, default: u32) -> u32 {
 }
 
 /// An exclusive `flock` held until dropped.
+#[derive(Debug)]
 pub struct FileLock(#[allow(dead_code)] File);
 
 fn flock(path: &Path, nonblocking: bool) -> std::io::Result<Option<FileLock>> {
@@ -309,6 +339,28 @@ impl Drop for EnvVar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn program_resolution_ignores_relative_path_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let relative = dir.path().strip_prefix("/").unwrap();
+        let program = dir.path().join("codex");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // From / this relative entry would find the executable; it is always skipped.
+        let _path = EnvVar::set("PATH", std::env::join_paths([relative, Path::new("")]).unwrap());
+        assert!(resolve_program("codex").is_err());
+        assert!(resolve_program("./codex").is_err());
+        let _absolute = EnvVar::set("PATH", std::env::join_paths([relative, dir.path()]).unwrap());
+        assert_eq!(resolve_program("codex").unwrap(), program.canonicalize().unwrap());
+        assert_eq!(resolve_program(program.to_str().unwrap()).unwrap(), program.canonicalize().unwrap());
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(resolve_program(program.to_str().unwrap()).is_err());
+        assert!(resolve_program(dir.path().to_str().unwrap()).is_err());
+    }
 
     #[test]
     fn worktree_fingerprint_sees_untracked_and_tracked_edits() {

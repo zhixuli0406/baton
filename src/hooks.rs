@@ -51,9 +51,26 @@ fn log_event(input: &Value) {
     }
 }
 
+/// Inputs are canonical paths; missing configuration or paths never bypass hooks.
+fn worker_hooks_skipped(marker: bool, current: Option<&Path>, configured: Option<&Path>) -> bool {
+    marker && matches!((current, configured), (Some(current), Some(configured)) if current == configured)
+}
+
+fn is_claude_worker() -> bool {
+    let marker = std::env::var("BATON_CLAUDE_WORKER").as_deref() == Ok("1");
+    if !marker { return false; }
+    let current = std::env::var_os("CLAUDE_CONFIG_DIR").and_then(|p| PathBuf::from(p).canonicalize().ok());
+    let configured = Config::load().ok().filter(|c| !c.claude.account.is_empty())
+        .and_then(|c| crate::account::config_dir(&c.claude.account).ok())
+        .map(|dir| dir.unwrap_or_else(paths::claude_default_dir))
+        .and_then(|dir| dir.canonicalize().ok());
+    worker_hooks_skipped(marker, current.as_deref(), configured.as_deref())
+}
+
 /// `StopFailure`: on a plan usage limit, start a handoff in the background.
 /// Returns the stdout to print (only `terminalSequence` is honoured here).
 pub fn stop_failure(input: &Value) -> Result<Option<Value>> {
+    if is_claude_worker() { return Ok(None); }
     log_event(input);
     let error = str_field(input, "error");
     let message = str_field(input, "last_assistant_message");
@@ -147,6 +164,7 @@ pub fn pre_tool_use(input: &Value) -> Result<Option<Value>> {
 
 /// `UserPromptSubmit`: tell Claude about an active or finished handoff.
 pub fn user_prompt_submit(input: &Value) -> Result<Option<Value>> {
+    if is_claude_worker() { return Ok(None); }
     let cwd = cwd_of(input);
     if let Some(active) = handoff::active_for(&cwd) {
         return Ok(Some(context_reply("UserPromptSubmit", active_message(&active))));
@@ -171,6 +189,57 @@ fn deliver_finished(event: &str, input: &Value, cwd: &Path) -> Result<Option<Val
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_hook_bypass_requires_matching_account_and_never_skips_edit_gate() {
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _home = paths::EnvVar::set("BATON_HOME", dir.path());
+        let _worker = paths::EnvVar::set("BATON_CLAUDE_WORKER", "1");
+        let account = paths::accounts_dir().join("work");
+        std::fs::create_dir_all(&account).unwrap();
+        std::fs::write(paths::config_file(), "[claude]\naccount = \"work\"\n").unwrap();
+        let m = handoff::Meta {
+            id: "x".into(),
+            session_id: String::new(),
+            cwd: dir.path().canonicalize().unwrap(),
+            transcript_path: None,
+            agent: crate::agents::Agent::Codex,
+            mode: crate::agents::Mode::Write,
+            model: None,
+            timeout_secs: 1,
+            status: Status::Pending,
+            trigger: "manual".into(),
+            pid: None,
+            created_at: paths::now_rfc3339(),
+            started_at: None,
+            finished_at: None,
+            note: None,
+            sensitive_changes: vec![".mcp.json".into()],
+        };
+        handoff::save(&m).unwrap();
+        let input = json!({"cwd": dir.path(), "error":"rate_limit", "last_assistant_message":"You've hit your weekly limit", "tool_name":"Write"});
+        let _current = paths::EnvVar::set("CLAUDE_CONFIG_DIR", &account);
+        assert!(stop_failure(&input).unwrap().is_none());
+        assert!(user_prompt_submit(&input).unwrap().is_none());
+        assert_eq!(pre_tool_use(&input).unwrap().unwrap()["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(!paths::events_log().exists());
+        let _other = paths::EnvVar::set("CLAUDE_CONFIG_DIR", dir.path());
+        assert!(user_prompt_submit(&input).unwrap().is_some());
+        // Invalid config demonstrates StopFailure took its normal path.
+        std::fs::write(paths::config_file(), "invalid toml [").unwrap();
+        assert!(stop_failure(&input).is_err());
+        assert!(paths::events_log().exists());
+        assert_eq!(pre_tool_use(&input).unwrap().unwrap()["hookSpecificOutput"]["permissionDecision"], "deny");
+        let _matching = paths::EnvVar::set("CLAUDE_CONFIG_DIR", &account);
+        assert!(!is_claude_worker());
+        std::fs::write(paths::config_file(), "[claude]\naccount = \"\"\n").unwrap();
+        assert!(!is_claude_worker());
+        let path = Path::new("/account");
+        assert!(!worker_hooks_skipped(false, Some(path), Some(path)));
+        assert!(!worker_hooks_skipped(true, None, Some(path)));
+        assert!(!worker_hooks_skipped(true, Some(path), None));
+    }
 
     #[test]
     fn report_is_fenced_as_data() {

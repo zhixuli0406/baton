@@ -238,7 +238,7 @@ fn handoff_cmd(cmd: HandoffCmd) -> Result<()> {
                 None => config.handoff.agent,
                 Some(a) => match Agent::parse(&a) {
                     Some(a) => a,
-                    None => bail!("unknown agent {a} (codex, grok)"),
+                    None => bail!("unknown agent {a} (codex, grok, claude)"),
                 },
             };
             let mode = match mode.as_deref() {

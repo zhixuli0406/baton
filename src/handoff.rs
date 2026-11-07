@@ -632,6 +632,52 @@ pub fn latest_transcript(cwd: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn worker_runs_enabled_claude_account() {
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let w = worker(Mode::ReadOnly, "echo CODEX_DONE", GROK_OK);
+        let home = paths::baton_home();
+        let account = paths::accounts_dir().join("work");
+        std::fs::create_dir_all(&account).unwrap();
+        std::fs::write(account.join(".claude.json"), r#"{"oauthAccount":{"accountUuid":"worker-account"}}"#).unwrap();
+        let bin = quota::test_support::script(&home, "claude", r#"#!/bin/sh
+cat >/dev/null
+touch claude-ran
+echo '{"result":"CLAUDE DONE"}'
+"#);
+        let _bin = paths::EnvVar::set("BATON_CLAUDE_BIN", bin);
+        let _caller = paths::EnvVar::set("CLAUDE_CONFIG_DIR", &home);
+        std::fs::write(paths::config_file(), "[claude]\naccount = \"work\"\n[handoff]\nagent = \"claude\"\n").unwrap();
+        let mut meta = load("20261030-rotation").unwrap();
+        meta.agent = Agent::Claude;
+        save(&meta).unwrap();
+        let (meta, report) = finish().await;
+        assert_eq!(meta.status, Status::Done, "{report}");
+        assert_eq!(meta.agent, Agent::Claude);
+        assert!(report.contains("CLAUDE DONE"), "{report}");
+        assert!(w.repo.join("claude-ran").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn unavailable_claude_handoff_falls_back_to_rotation() {
+        let _lock = paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let w = worker(Mode::ReadOnly, "echo CODEX_DONE", GROK_OK);
+        let mut meta = load("20261030-rotation").unwrap();
+        meta.agent = Agent::Claude;
+        save(&meta).unwrap();
+        let (meta, report) = finish().await;
+        assert_eq!(meta.status, Status::Done, "{report}");
+        assert_eq!(meta.agent, Agent::Codex);
+        assert!(report.contains("claude unavailable"), "{report}");
+        assert!(report.contains("CODEX_DONE"), "{report}");
+        assert!(!w.repo.join("grok-ran").exists());
+    }
+
+
     #[test]
     fn ids_are_validated() {
         assert!(valid_id("20261021-120000-abcd1234"));
@@ -678,6 +724,7 @@ mod tests {
         let mut config = Config::default();
         assert_eq!(rotation_order(Agent::Codex, &config), vec![Agent::Codex, Agent::Grok]);
         assert_eq!(rotation_order(Agent::Grok, &config), vec![Agent::Grok, Agent::Codex]);
+        assert_eq!(rotation_order(Agent::Claude, &config), vec![Agent::Claude, Agent::Codex, Agent::Grok]);
         config.rotation.enabled = false;
         assert_eq!(rotation_order(Agent::Grok, &config), vec![Agent::Grok]);
         config.rotation.enabled = true;
