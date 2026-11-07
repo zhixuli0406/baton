@@ -110,6 +110,27 @@ pub fn append_private(path: &Path, line: &str) -> std::io::Result<()> {
     writeln!(open_private(path, true)?, "{line}")
 }
 
+/// Append advisory logs without following symlinks or blocking on special files.
+pub fn append_private_regular(path: &Path, line: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    writeln!(file, "{line}")
+}
+
 /// Replace a file atomically, keeping `mode`. Follows a symlink at `path`
 /// so a linked file (e.g. a synced settings.json) stays linked.
 pub fn atomic_write(path: &Path, body: impl AsRef<[u8]>, mode: u32) -> std::io::Result<()> {
@@ -173,8 +194,9 @@ pub fn repo_root(path: &Path) -> PathBuf {
     git_toplevel(&canon).unwrap_or(canon)
 }
 
-fn git_command(path: &Path) -> std::process::Command {
+pub(crate) fn git_command(path: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new("git");
+    cmd.env_remove("TYPESAFE_API_KEY");
     cmd.current_dir(path);
     for key in [
         "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
@@ -292,7 +314,7 @@ mod tests {
     fn worktree_fingerprint_sees_untracked_and_tracked_edits() {
         let repo = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(repo.path()).unwrap();
-        assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(&root).status().unwrap().success());
+        assert!(std::process::Command::new("git").env_remove("TYPESAFE_API_KEY").args(["init", "-q"]).current_dir(&root).status().unwrap().success());
         let empty = worktree_fingerprint(&root).unwrap();
         std::fs::write(root.join("a.txt"), "one").unwrap();
         let added = worktree_fingerprint(&root).unwrap();
@@ -301,7 +323,7 @@ mod tests {
         let edited = worktree_fingerprint(&root).unwrap();
         assert_ne!(added, edited);
         assert_eq!(edited, worktree_fingerprint(&root).unwrap());
-        assert!(std::process::Command::new("git").args(["add", "a.txt"]).current_dir(&root).status().unwrap().success());
+        assert!(std::process::Command::new("git").env_remove("TYPESAFE_API_KEY").args(["add", "a.txt"]).current_dir(&root).status().unwrap().success());
         let staged = worktree_fingerprint(&root).unwrap();
         std::fs::write(root.join("a.txt"), "three").unwrap();
         assert_ne!(staged, worktree_fingerprint(&root).unwrap());
@@ -313,6 +335,7 @@ mod tests {
     fn git_command_removes_ambient_repository_and_config_overrides() {
         let cmd = git_command(Path::new("/"));
         for key in [
+            "TYPESAFE_API_KEY",
             "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
             "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
             "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
@@ -389,6 +412,31 @@ mod tests {
             got
         });
         assert!(free);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn advisory_append_rejects_symlinks_and_special_files() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, "untouched").unwrap();
+        let link = dir.path().join("link");
+        symlink(&target, &link).unwrap();
+        assert!(append_private_regular(&link, "bad").is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+        assert!(append_private_regular(dir.path(), "bad").is_err());
+        let fifo = dir.path().join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: NUL-terminated path and valid mode.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(append_private_regular(&fifo, "bad").is_err());
+        let regular = dir.path().join("regular");
+        append_private_regular(&regular, "one").unwrap();
+        std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o644)).unwrap();
+        append_private_regular(&regular, "two").unwrap();
+        assert_eq!(mode_of(&regular, 0), 0o600);
+        assert_eq!(std::fs::read_to_string(regular).unwrap(), "one\ntwo\n");
     }
 
     #[test]

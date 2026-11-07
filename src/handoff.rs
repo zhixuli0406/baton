@@ -283,6 +283,7 @@ fn spawn_worker(id: &str) -> Result<()> {
     paths::write_private(&log_path, "")?;
     let log = std::fs::OpenOptions::new().append(true).open(&log_path)?;
     let mut cmd = std::process::Command::new(exe);
+    cmd.env_remove("TYPESAFE_API_KEY");
     cmd.args(["handoff", "run", id])
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
@@ -589,6 +590,7 @@ pub fn notify(message: &str) {
     {
         let esc = message.replace('\\', "\\\\").replace('"', "\\\"");
         let _ = std::process::Command::new("osascript")
+            .env_remove("TYPESAFE_API_KEY")
             .args(["-e", &format!("display notification \"{esc}\" with title \"baton\"")])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -597,6 +599,7 @@ pub fn notify(message: &str) {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = std::process::Command::new("notify-send")
+            .env_remove("TYPESAFE_API_KEY")
             .args(["baton", message])
             .status();
     }
@@ -701,7 +704,7 @@ mod tests {
         let grok = script(&root, "grok", &format!("#!/bin/sh\n{grok}\n"));
         let repo = root.join("repo");
         std::fs::create_dir(&repo).unwrap();
-        assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(&repo).status().unwrap().success());
+        assert!(std::process::Command::new("git").env_remove("TYPESAFE_API_KEY").args(["init", "-q"]).current_dir(&repo).status().unwrap().success());
         let vars = vec![
             paths::EnvVar::set("BATON_HOME", root.join("home")),
             paths::EnvVar::set("BATON_CODEX_BIN", &codex),

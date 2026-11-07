@@ -551,7 +551,7 @@ async fn call_tool(params: &Value, default_cwd: &std::path::Path) -> Result<Valu
             true,
         ));
     }
-    let req = Request {
+    let mut req = Request {
         agent: args.agent,
         mode: args.mode,
         model: args.model.clone().or_else(|| config.model_for(args.agent)),
@@ -560,14 +560,18 @@ async fn call_tool(params: &Value, default_cwd: &std::path::Path) -> Result<Valu
         cwd: args.cwd.clone(),
         timeout: Duration::from_secs(args.timeout_secs),
     };
+    let log_path = run_log_path(&req);
+    let advice = crate::jev::advise(&mut req, None, &config.jev, &catalog, &log_path).await;
+    persist_advice(advice.as_ref());
+    let jev_note = advice.as_ref().map_or_else(String::new, |a| a.reply_note());
     let result = agents::run(&req).await;
-    let log_note = note_of(&write_run_log(&req, &result));
+    let log_note = note_of(&write_run_log(&req, &result, &log_path, advice.as_ref()));
     Ok(match result {
         Ok(o) => {
             let body = cap(&o.text, REPLY_CAP_CHARS, &log_note);
             tool_text(
                 &format!(
-                    "[{} · {} · {} · {:.1}s · {}]\n{}{}",
+                    "{jev_note}[{} · {} · {} · {:.1}s · {}]\n{}{}",
                     req.agent.name(),
                     model_label(&req),
                     req.mode.name(),
@@ -592,7 +596,7 @@ async fn call_tool(params: &Value, default_cwd: &std::path::Path) -> Result<Valu
                 }
             }
             tool_text(
-                &format!("[{} · {} · {} · {}]\n{body}", req.agent.name(), model_label(&req), req.mode.name(), log_note),
+                &format!("{jev_note}[{} · {} · {} · {}]\n{body}", req.agent.name(), model_label(&req), req.mode.name(), log_note),
                 true,
             )
         }
@@ -647,7 +651,7 @@ async fn call_delegate(args: &Value, default_cwd: &Path, config: &Config) -> Val
 }
 
 async fn run_delegated(parsed: &DelegateArgs, step: &routing::Step, config: &Config, skipped: &mut Vec<String>, notes: &mut Vec<String>, may_redeem: &mut bool, allow_retry: bool) -> StepOutcome {
-    let req = Request {
+    let mut req = Request {
         agent: step.agent,
         mode: parsed.mode,
         task: parsed.task.clone(),
@@ -656,14 +660,22 @@ async fn run_delegated(parsed: &DelegateArgs, step: &routing::Step, config: &Con
         effort: Some(step.effort),
         timeout: Duration::from_secs(parsed.timeout_secs),
     };
+    let log_path = run_log_path(&req);
+    let advice = if parsed.kind == Kind::Code || req.model.as_deref().is_some_and(|m| m.starts_with("gpt-daybreak-")) {
+        crate::jev::advise(&mut req, Some(parsed.difficulty), &config.jev, &config.catalog(), &log_path).await
+    } else {
+        None
+    };
+    persist_advice(advice.as_ref());
+    let jev_note = advice.as_ref().map_or_else(String::new, |a| a.reply_note());
     let before = (req.mode == Mode::Write).then(|| paths::worktree_fingerprint(&req.cwd));
     let result = agents::run(&req).await;
-    let log_note = note_of(&write_run_log(&req, &result));
+    let log_note = note_of(&write_run_log(&req, &result, &log_path, advice.as_ref()));
     let skipped_line = |skipped: &[String]| if skipped.is_empty() { String::new() } else { format!("skipped: {}\n", skipped.join("; ")) };
     let e = match result {
         Ok(o) => {
             let text = format!(
-                "[delegate → {} · {} · {} · {:.1}s · {log_note}]\n{}{}{}",
+                "{jev_note}[delegate → {} · {} · {} · {:.1}s · {log_note}]\n{}{}{}",
                 req.agent.name(),
                 model_label(&req),
                 req.mode.name(),
@@ -709,7 +721,7 @@ async fn run_delegated(parsed: &DelegateArgs, step: &routing::Step, config: &Con
         (false, _) => "Not retried on another agent: this failure is not a quota or availability problem.".to_string(),
     };
     let text = format!(
-        "[delegate → {} · {} · {} · {log_note}]\n{}{}{}\n{why}",
+        "{jev_note}[delegate → {} · {} · {} · {log_note}]\n{}{}{}\n{why}",
         req.agent.name(),
         model_label(&req),
         req.mode.name(),
@@ -761,24 +773,30 @@ fn cap(text: &str, max: usize, note: &str) -> String {
     format!("{head}\n\n[truncated at {max} chars; full text in {note}]")
 }
 
-fn write_run_log(req: &Request, result: &Result<agents::Outcome, agents::AgentError>) -> std::io::Result<PathBuf> {
+fn persist_advice(advice: Option<&crate::jev::Advice>) {
+    if let Some(advice) = advice {
+        let home = paths::baton_home();
+        if paths::ensure_dir(&home).and_then(|()| advice.append_to(&home.join("jev.jsonl"))).is_err() {
+            eprintln!("jev: log write failed");
+        }
+    }
+}
+
+fn run_log_path(req: &Request) -> PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
-    let dir = paths::runs_dir();
-    paths::ensure_dir(&dir)?;
-    let path = dir.join(format!(
-        "{}-{}-{}-{}.md",
-        paths::stamp(),
-        req.agent.name(),
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
+    paths::runs_dir().join(format!("{}-{}-{}-{}.md", paths::stamp(), req.agent.name(), std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)))
+}
+
+fn write_run_log(req: &Request, result: &Result<agents::Outcome, agents::AgentError>, path: &Path, advice: Option<&crate::jev::Advice>) -> std::io::Result<PathBuf> {
+    paths::ensure_dir(&paths::runs_dir())?;
+    let jev_line = advice.map_or_else(String::new, |a| format!("- jev: {}\n", a.line()));
     let (status, body) = match result {
         Ok(o) => (format!("ok ({:.1}s, exit {:?}, slot wait {:.2}s)", o.duration_secs, o.exit_code, o.slot_wait_secs), o.text.as_str()),
         Err(e) => ("error".to_string(), e.0.as_str()),
     };
     let text = format!(
-        "# {} run\n\n- time: {}\n- mode: {}\n- model: {}\n- cwd: {}\n- status: {}\n\n## Task\n\n{}\n\n## Reply\n\n{}\n",
+        "# {} run\n\n- time: {}\n- mode: {}\n- model: {}\n- cwd: {}\n- status: {}\n{jev_line}\n## Task\n\n{}\n\n## Reply\n\n{}\n",
         req.agent.name(),
         paths::now_rfc3339(),
         req.mode.name(),
@@ -788,8 +806,8 @@ fn write_run_log(req: &Request, result: &Result<agents::Outcome, agents::AgentEr
         req.task,
         body
     );
-    paths::write_private(&path, text)?;
-    Ok(path)
+    paths::write_private(path, text)?;
+    Ok(path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -806,6 +824,36 @@ mod tests {
 
     fn parse(p: &Value) -> Result<Result<CallArgs, String>, (i64, String)> {
         parse_call(p, &dir(), &cat(), &[])
+    }
+
+    #[test]
+    fn jev_run_record_joins_jsonl_without_secret() {
+        let _guard = paths::TEST_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = paths::EnvVar::set("BATON_HOME", dir.path());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut req = Request {
+                agent: Agent::Codex, mode: Mode::ReadOnly,
+                model: Some("gpt-6-astra".into()), effort: Some(Effort::High),
+                task: "Rename a variable".into(), cwd: dir.path().into(), timeout: Duration::from_secs(60),
+            };
+            let config = crate::config::JevConfig { enabled: true, ..Default::default() };
+            let path = run_log_path(&req);
+            let advice = crate::jev::advise_with(&mut req, None, &config, &cat(), &path,
+                async { Some("test-secret-do-not-log".into()) }, "http://127.0.0.1:1").await.unwrap();
+            persist_advice(Some(&advice));
+            let result = Err(agents::AgentError("CLI unavailable".into(), ErrorKind::Unavailable));
+            assert_eq!(write_run_log(&req, &result, &path, Some(&advice)).unwrap(), path);
+            let record = std::fs::read_to_string(&path).unwrap();
+            let jsonl = std::fs::read_to_string(dir.path().join("jev.jsonl")).unwrap();
+            assert!(record.contains("- jev: error network"));
+            assert!(!record.contains("test-secret-do-not-log"));
+            assert!(!jsonl.contains("test-secret-do-not-log"));
+            let metadata: Value = serde_json::from_str(jsonl.trim()).unwrap();
+            assert_eq!(metadata["run_log"].as_str().unwrap(), path.file_name().unwrap().to_str().unwrap());
+            #[cfg(unix)] assert_eq!(paths::mode_of(&path, 0), 0o600);
+        });
     }
 
     #[test]
@@ -905,7 +953,7 @@ mod tests {
     fn write_scope_is_confined_to_the_project_repo() {
         let repo = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(repo.path()).unwrap();
-        assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(&root).status().unwrap().success());
+        assert!(std::process::Command::new("git").env_remove("TYPESAFE_API_KEY").args(["init", "-q"]).current_dir(&root).status().unwrap().success());
         let sub = root.join("sub");
         std::fs::create_dir(&sub).unwrap();
         assert!(check_write_scope(&sub, &root, &[]).is_ok());
@@ -1239,7 +1287,7 @@ mod tests {
         let f = fakes(probe_result(13, false), &exec, "cat >/dev/null; echo '{\"text\":\"SHOULD NOT RUN\"}'");
         let repo = std::fs::canonicalize(f.dir.path()).unwrap().join("repo");
         std::fs::create_dir(&repo).unwrap();
-        assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(&repo).status().unwrap().success());
+        assert!(std::process::Command::new("git").env_remove("TYPESAFE_API_KEY").args(["init", "-q"]).current_dir(&repo).status().unwrap().success());
         let (text, err) = text_of(&call_delegate(&json!({"task":"x","mode":"write"}), &repo, &Config::default()).await);
         assert!(err, "{text}");
         assert!(text.contains("Not handed to another agent: the working tree changed while codex ran"), "{text}");
@@ -1294,7 +1342,7 @@ mod tests {
         quota::record(&quota::parse_codex(&probe_result(13, false), chrono::Utc::now().timestamp(), 3600));
         let repo = f.dir.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
-        assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(&repo).status().unwrap().success());
+        assert!(std::process::Command::new("git").env_remove("TYPESAFE_API_KEY").args(["init", "-q"]).current_dir(&repo).status().unwrap().success());
         let (text, err) = text_of(&call_delegate(&json!({"task":"x","mode":"write"}), &repo, &Config::default()).await);
         assert!(err && text.contains("Not handed to another agent") && text.contains("Quota was restored"), "{text}");
         assert!(!text.contains("skipped:") && !text.contains("SHOULD_NOT_RUN"), "{text}");

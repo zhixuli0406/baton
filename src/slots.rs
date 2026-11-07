@@ -54,6 +54,7 @@ mod tests {
     async fn slot_is_exclusive_across_processes_and_released_on_death() {
         let dir = tempfile::tempdir().unwrap();
         let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .env_remove("TYPESAFE_API_KEY")
             .args(["--exact", "slots::tests::slot_lock_child"])
             .env("BATON_SLOT_TEST_DIR", dir.path())
             .stdout(std::process::Stdio::null())

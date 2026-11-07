@@ -163,6 +163,19 @@ baton 啟動的每個 `codex exec`（`ask_codex`、`delegate`、接手 worker）
 
 同時執行的 CLI 數量有上限，由 `[concurrency]` 設定，預設 Codex 與 Grok 各 4 個，`0` 表示不限。上限跨所有 baton 程序共用（每個 Claude Code session 各有一個 MCP server），靠 `~/.baton/slots/` 下的檔案鎖計數；程序結束或當掉時鎖會自動釋放。沒有空位時每 2 秒重試一次，等待時間算進該次呼叫的 `timeout_secs`，等到逾時就回錯誤，訊息會寫明 CLI 沒有啟動、沒有耗用 token。等了多久記在 run log 的狀態列（`slot wait`）。額度探針不佔位。
 
+### Jev 派工顧問（選用，預設關閉）
+
+開啟後，baton 在啟動 Codex 前，會把 Claude 寫的交辦內容送到 TypeSafe 的 Jev（`https://api.typesafe.ai/v1/systemone`）做判斷。baton 不會主動讀 repo 檔案送出，但交辦內容會整段送出（最多 `max_state_chars` 字元）；交辦裡貼的程式碼、log、設計說明都會一起送到 TypeSafe 位於美國的伺服器。送出前會遮罩常見的憑證格式：PEM 私鑰、`Bearer`／`Authorization:`／`Cookie:` 的值、`sk-`／`ghp_`／`github_pat_`／`glpat-`／`AKIA`／`AIza` 開頭的 key、JWT、`xoxa-`／`xoxb-`／`xoxp-`／`xoxr-`／`xoxs-` 開頭的 Slack token，以及 40 字元以上的長字串。鍵名以 `password`／`passwd`／`pwd`／`secret`／`token`／`api_key`／`apikey`／`api-key`／`access_key`／`private_key`／`client_secret`／`auth`／`credential`／`credentials` 結尾（不分大小寫），後接 `=` 或 `:` 時，或作為 `--password value` 這類旗標並以空格／Tab 接值時，也會保留鍵名、遮罩值；支援引號與 JSON 格式，值即使只有一個字元也會遮罩。`scheme://user:password@host` URL userinfo 中的密碼也會遮罩。
+
+- **難度**：`delegate` 的 `kind = "code"`，以及 `ask_codex` 解析到 frontier 模型（`gpt-6-astra`）時，問 Jev 這件工作是機械小改、日常實作，還是困難工作。`enforce` 模式下，Claude 選了 `hard`、Jev 判為困難的機率又低於 `difficulty_downgrade_below`（預設 0.15）時，改用 `normal` 的模型與推理深度。交辦內容有一行以 `HARD-REASON:` 開頭就不降級。只會降、不會升，`easy`／`normal` 不動。
+- **安全審查**：送 Daybreak（`gpt-daybreak-*`）時，`enforce` 模式只套用一條固定規則：推理深度 `xhigh`／`max` 降到 `high`。另外會比對敏感路徑，並問 Jev 這是不是窄範圍重審，但**這個答案只記錄、永遠不套用**。Jev 的回應來自外部，不讓它決定降低安全審查。
+
+`shadow` 模式只記錄，模型與推理深度完全不變，建議先跑一週再決定要不要改成 `enforce`。`enforce` 實際改了設定時，回覆開頭會出現 `[jev: hard→normal p2=…]` 或 `[jev: effort xhigh→high]`。
+
+API key 優先讀環境變數 `TYPESAFE_API_KEY`，其次讀 macOS 鑰匙圈 service `typesafe-api`、account `jev`（`security add-generic-password -U -s typesafe-api -a jev -w`）。key 只在 MCP server 程序內快取，新增 key 後要重開 MCP server（`/mcp` reconnect）；`TYPESAFE_API_KEY` 不會傳給 Codex、Grok、接手 worker、git 或其他 helper 子程序。請求不跟隨轉址、不走代理伺服器。工作目錄解析成實際路徑後，含 `exclude_path_substrings`（預設 `commercial`，不分大小寫）的派工完全不呼叫 Jev。沒有 key、逾時（`timeout_ms`，預設 4000，讀鑰匙圈與 git 都算在內）、HTTP 錯誤、回應超過 64 KiB 或格式不對、git 查詢失敗時，一律照原本的模型與推理深度執行。
+
+每次判斷在 `~/.baton/jev.jsonl` 記一行：時間、對應的 run log 檔名、模式、原本與最後的模型／推理深度、Jev 的機率、是否會改／是否已改、命中的敏感路徑、延遲、input token 數、錯誤碼。不記交辦內容與 key。run log 也多一行 `- jev: …`。
+
 ### 設定檔
 
 設定檔在 `~/.baton/config.toml`，內容與預設值：
@@ -189,6 +202,17 @@ reset_min_wait_secs = 3600 # 距自然重置不到這麼多秒時保留券
 [concurrency]          # 同時執行的 CLI 上限，跨所有 baton 程序；0 表示不限
 codex = 4
 grok = 4
+
+[jev]                  # Jev 派工顧問，見上方說明
+enabled = false
+mode = "shadow"        # shadow：只記錄；enforce：依規則降級
+model = "jev-latest"
+timeout_ms = 4000
+max_state_chars = 24000        # 交辦內容超過時保留開頭 2/3 與結尾 1/3
+difficulty_downgrade_below = 0.15
+rereview_low_effort_above = 0.8
+exclude_path_substrings = ["commercial"]
+sensitive_path_patterns = ["auth", "fs_safe", "sandbox", "crypto", "secret", "credential", "token", "oauth", "permission", "approval", "acl", "keychain", "redact", "signature", "inject"]
 
 [models]               # 選填：各 agent 的預設模型（沒給 model 也沒給 capability 時用）
 # codex = "gpt-6.1-sol"
@@ -224,7 +248,7 @@ user scope 的 MCP server 設定存在各帳號的 `.claude.json` 裡。`account
 
 ### 資料存放
 
-`~/.baton` 權限 0700，裡面的檔案 0600。內容包括呼叫紀錄（`runs/`）、交接單與報告（`handoffs/`）、各家額度狀態（`quota.json`）、重置券兌換嘗試（`resets.jsonl`，含時間、券 ID、冪等鍵，每次嘗試各有一行 `pending` 與最終結果；只有 `pending` 表示結果未知）、hook 事件紀錄（`events.jsonl`，用來比對實際撞額度時 Claude Code 送出的訊息）、並行上限的鎖檔（`slots/`）。
+`~/.baton` 權限 0700，裡面的檔案 0600。內容包括呼叫紀錄（`runs/`）、交接單與報告（`handoffs/`）、各家額度狀態（`quota.json`）、重置券兌換嘗試（`resets.jsonl`，含時間、券 ID、冪等鍵，每次嘗試各有一行 `pending` 與最終結果；只有 `pending` 表示結果未知）、hook 事件紀錄（`events.jsonl`，用來比對實際撞額度時 Claude Code 送出的訊息）、並行上限的鎖檔（`slots/`）、Jev 判斷紀錄（`jev.jsonl`）。
 
 ## 開發
 

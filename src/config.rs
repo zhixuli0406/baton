@@ -15,6 +15,7 @@ use crate::paths;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub handoff: HandoffConfig,
+    pub jev: JevConfig,
     pub write: WriteConfig,
     /// Default model per agent name (`codex`, `grok`).
     pub models: HashMap<String, String>,
@@ -22,6 +23,49 @@ pub struct Config {
     pub catalog: Vec<catalog::Entry>,
     pub rotation: RotationConfig,
     pub concurrency: ConcurrencyConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JevMode {
+    Shadow,
+    Enforce,
+}
+
+impl JevMode {
+    pub fn name(self) -> &'static str {
+        match self { Self::Shadow => "shadow", Self::Enforce => "enforce" }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JevConfig {
+    pub enabled: bool,
+    pub mode: JevMode,
+    pub model: String,
+    pub timeout_ms: u64,
+    pub max_state_chars: usize,
+    pub difficulty_downgrade_below: f64,
+    pub rereview_low_effort_above: f64,
+    pub exclude_path_substrings: Vec<String>,
+    pub sensitive_path_patterns: Vec<String>,
+}
+
+impl Default for JevConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: JevMode::Shadow,
+            model: "jev-latest".into(),
+            timeout_ms: 4000,
+            max_state_chars: 24000,
+            difficulty_downgrade_below: 0.15,
+            rereview_low_effort_above: 0.8,
+            exclude_path_substrings: vec!["commercial".into()],
+            sensitive_path_patterns: ["auth", "fs_safe", "sandbox", "crypto", "secret", "credential", "token", "oauth", "permission", "approval", "acl", "keychain", "redact", "signature", "inject"].into_iter().map(str::to_string).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -116,6 +160,9 @@ impl Config {
             anyhow::ensure!(root.is_absolute(), "[write] allowed_roots entries must be absolute paths or start with ~/; got {}", root.display());
         }
         validate_rotation(&config.rotation)?;
+        for value in [config.jev.difficulty_downgrade_below, config.jev.rereview_low_effort_above] {
+            anyhow::ensure!(value.is_finite() && (0.0..=1.0).contains(&value), "[jev] thresholds must be probabilities");
+        }
         Ok(config)
     }
 
@@ -148,6 +195,47 @@ const MAX_ROTATION_SECS: u64 = 30 * 24 * 3600;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jev_defaults_and_explicit_values() {
+        let defaults = Config::parse("").unwrap().jev;
+        assert!(!defaults.enabled);
+        assert_eq!(defaults.mode, JevMode::Shadow);
+        assert_eq!(defaults.model, "jev-latest");
+        assert_eq!(defaults.timeout_ms, 4000);
+        assert_eq!(defaults.max_state_chars, 24000);
+        assert_eq!(defaults.difficulty_downgrade_below, 0.15);
+        assert_eq!(defaults.rereview_low_effort_above, 0.8);
+        assert_eq!(defaults.exclude_path_substrings, ["commercial"]);
+        assert!(defaults.sensitive_path_patterns.contains(&"auth".into()));
+        let c = Config::parse(r#"[jev]
+            enabled = true
+            mode = "enforce"
+            model = "jev-test"
+            timeout_ms = 12
+            max_state_chars = 9
+            difficulty_downgrade_below = 0.2
+            rereview_low_effort_above = 0.9
+            exclude_path_substrings = ["private"]
+            sensitive_path_patterns = ["auth"]
+        "#).unwrap().jev;
+        assert!(c.enabled);
+        assert_eq!(c.mode, JevMode::Enforce);
+        assert_eq!(c.model, "jev-test");
+        assert_eq!(c.timeout_ms, 12);
+        assert_eq!(c.max_state_chars, 9);
+        assert_eq!(c.difficulty_downgrade_below, 0.2);
+        assert_eq!(c.rereview_low_effort_above, 0.9);
+        assert_eq!(c.exclude_path_substrings, ["private"]);
+        assert_eq!(c.sensitive_path_patterns, ["auth"]);
+    }
+
+    #[test]
+    fn jev_rejects_invalid_config() {
+        for text in ["[jev]\nmode = \"invalid\"", "[jev]\nunknown = true", "[jev]\ndifficulty_downgrade_below = -0.1", "[jev]\nrereview_low_effort_above = 1.1"] {
+            assert!(Config::parse(text).is_err());
+        }
+    }
 
     #[test]
     fn empty_file_gives_defaults() {

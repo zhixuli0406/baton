@@ -74,6 +74,7 @@ fn state_file(dir: Option<&Path>) -> PathBuf {
 
 pub fn claude_command(dir: Option<&Path>) -> Command {
     let mut cmd = Command::new(claude_bin());
+    cmd.env_remove("TYPESAFE_API_KEY");
     match dir {
         Some(d) => {
             cmd.env("CLAUDE_CONFIG_DIR", d);

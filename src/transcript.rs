@@ -238,6 +238,7 @@ fn brief_raw(d: &Digest, cwd: &Path, git: &str) -> String {
 pub fn git_state(cwd: &Path) -> String {
     let run = |args: &[&str]| {
         std::process::Command::new("git")
+            .env_remove("TYPESAFE_API_KEY")
             .args(args)
             .current_dir(cwd)
             .output()

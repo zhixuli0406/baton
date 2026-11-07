@@ -273,7 +273,7 @@ impl Drop for GroupGuard {
 }
 
 pub(crate) fn scrubbed(name: &str) -> bool {
-    name.starts_with("ANTHROPIC_") || name.starts_with("CLAUDE")
+    name == "TYPESAFE_API_KEY" || name.starts_with("ANTHROPIC_") || name.starts_with("CLAUDE")
 }
 
 /// Model IDs are passed as `--model=<id>`; keep them to a plain charset
@@ -611,6 +611,7 @@ mod tests {
     #[test]
     fn scrubs_claude_and_anthropic_env() {
         assert!(scrubbed("ANTHROPIC_API_KEY"));
+        assert!(scrubbed("TYPESAFE_API_KEY"));
         assert!(scrubbed("CLAUDE_CODE_OAUTH_TOKEN"));
         assert!(scrubbed("CLAUDECODE"));
         assert!(!scrubbed("PATH"));
@@ -636,6 +637,25 @@ mod tests {
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         let s = p.to_string_lossy().to_string();
         (d, s)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn agent_clis_do_not_inherit_typesafe_key() {
+        let _lock = crate::paths::TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (home, bin) = fake("printf '{\"text\":\"secret=<%s>\"}\\n' \"$TYPESAFE_API_KEY\"");
+        let _home = crate::paths::EnvVar::set("BATON_HOME", home.path());
+        let _key = crate::paths::EnvVar::set("TYPESAFE_API_KEY", "must-not-leak");
+        let _codex = crate::paths::EnvVar::set("BATON_CODEX_BIN", &bin);
+        let _grok = crate::paths::EnvVar::set("BATON_GROK_BIN", &bin);
+        for agent in [Agent::Codex, Agent::Grok] {
+            let mut r = req(agent, Mode::ReadOnly, None);
+            r.cwd = home.path().into();
+            let text = run(&r).await.unwrap().text;
+            assert!(text.contains("secret=<>"), "{text}");
+            assert!(!text.contains("must-not-leak"));
+        }
     }
 
     /// A background child holding stdout must not turn a finished call

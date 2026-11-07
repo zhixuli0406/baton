@@ -5,6 +5,7 @@ mod config;
 mod handoff;
 mod hooks;
 mod install;
+mod jev;
 mod mcp;
 mod mcp_handoff;
 mod paths;
